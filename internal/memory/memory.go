@@ -134,14 +134,39 @@ func (s *fsStore) Search(query string) ([]string, error) {
 // memory/*.md detail notes.
 const linkedSectionHeader = "## Linked memory"
 
-// Add appends a timestamped bullet to MEMORY.md (creating the directory and a
-// header on first write), then refreshes the linked-memory section. Empty
-// (whitespace-only) text is rejected.
+// memoryHeader opens a brand-new MEMORY.md.
+const memoryHeader = "# Memory\n\n"
+
+// Add adds a timestamped bullet to MEMORY.md (creating the directory and a
+// header on first write) and refreshes the linked-memory section, in one write.
+// Empty (whitespace-only) text is rejected.
+//
+// The bullet goes at the end of the index body, above the linked section. It
+// cannot simply be appended to the file: once a detail note exists the file
+// ends with that section, and a bullet appended there is part of the section,
+// which the refresh then rebuilds without it (#97).
 func (s *fsStore) Add(text string) error {
-	if err := appendBullet(s.Path(), "# Memory\n\n", text); err != nil {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ErrEmpty
+	}
+
+	existing, err := os.ReadFile(s.Path())
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return s.SyncLinks()
+	body := stripLinkedSection(string(existing))
+	if strings.TrimSpace(body) == "" {
+		body = memoryHeader
+	} else if !strings.HasSuffix(body, "\n") {
+		body += "\n"
+	}
+	body += bulletLine(text)
+
+	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(s.Path(), []byte(withLinkedSection(body, s.FilePointers())), 0o644)
 }
 
 // SyncLinks rewrites the "## Linked memory" section of MEMORY.md so it lists
@@ -158,15 +183,7 @@ func (s *fsStore) SyncLinks() error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	body := stripLinkedSection(string(existing))
-
-	updated := body
-	if len(pointers) > 0 {
-		if strings.TrimSpace(body) == "" {
-			body = "# Memory\n\n" // a brand-new index needs a header
-		}
-		updated = strings.TrimRight(body, "\n") + "\n\n" + linkedSectionHeader + "\n\n" + strings.Join(pointers, "\n") + "\n"
-	}
+	updated := withLinkedSection(stripLinkedSection(string(existing)), pointers)
 
 	if updated == string(existing) {
 		return nil // already current — no write
@@ -178,6 +195,19 @@ func (s *fsStore) SyncLinks() error {
 		return err
 	}
 	return os.WriteFile(s.Path(), []byte(updated), 0o644)
+}
+
+// withLinkedSection returns body (MEMORY.md without its linked section) with a
+// fresh "## Linked memory" section listing pointers at the end. With no
+// pointers it returns body unchanged.
+func withLinkedSection(body string, pointers []string) string {
+	if len(pointers) == 0 {
+		return body
+	}
+	if strings.TrimSpace(body) == "" {
+		body = memoryHeader // a brand-new index needs a header
+	}
+	return strings.TrimRight(body, "\n") + "\n\n" + linkedSectionHeader + "\n\n" + strings.Join(pointers, "\n") + "\n"
 }
 
 // stripLinkedSection removes the "## Linked memory" section (its header through
@@ -236,26 +266,76 @@ func (s *fsStore) FilePointers() []string {
 	return ptrs
 }
 
-// fileHook returns a one-line summary of a memory file: its first Markdown
-// heading (with leading '#'s stripped) or, failing that, its first non-empty
-// line. Returns "" if the file is unreadable or empty.
+// hookMaxRunes caps a note's hook in the index. Counted in runes, not bytes,
+// so the cut never splits a multi-byte character.
+const hookMaxRunes = 80
+
+// fileHook returns a one-line summary of a memory file: its frontmatter
+// `description` when it has one, else the first non-empty line of the body
+// (with leading '#'s stripped, so a heading reads as its text). Frontmatter is
+// never the hook — Promote and Supersede add it to notes that had none, and a
+// hook of "---" says nothing. Returns "" if the file is unreadable or empty.
 func fileHook(path string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	return noteHook(data)
+}
+
+// noteHook is fileHook on a note's contents.
+func noteHook(data []byte) string {
+	meta, body := parseFrontmatter(data)
+	if desc := strings.Join(strings.Fields(meta.Description), " "); desc != "" {
+		return truncateRunes(desc, hookMaxRunes)
+	}
+	lines := strings.Split(string(body), "\n")
+	// parseFrontmatter leaves a block it cannot read (bad YAML, CRLF fences) in
+	// the body; skip it here too rather than surface its fence or keys.
+	lines = skipFrontmatterLines(lines)
+	for _, line := range lines {
 		t := strings.TrimSpace(line)
 		if t == "" {
 			continue
 		}
 		t = strings.TrimSpace(strings.TrimLeft(t, "#"))
-		if len(t) > 80 {
-			t = t[:80] + "…"
+		if t == "" {
+			continue // a bare "#" line
 		}
-		return t
+		return truncateRunes(t, hookMaxRunes)
 	}
 	return ""
+}
+
+// skipFrontmatterLines drops a leading "---" fenced block from lines. A
+// leading fence with no closing one drops just the fence line.
+func skipFrontmatterLines(lines []string) []string {
+	first := 0
+	for first < len(lines) && strings.TrimSpace(lines[first]) == "" {
+		first++
+	}
+	if first == len(lines) || strings.TrimSpace(lines[first]) != "---" {
+		return lines
+	}
+	for j := first + 1; j < len(lines); j++ {
+		if strings.TrimSpace(lines[j]) == "---" {
+			return lines[j+1:]
+		}
+	}
+	return lines[first+1:]
+}
+
+// truncateRunes returns s cut to at most n runes, with "…" appended when
+// anything was cut. It never splits a UTF-8 sequence.
+func truncateRunes(s string, n int) string {
+	count := 0
+	for i := range s {
+		if count == n {
+			return strings.TrimRight(s[:i], " ") + "…"
+		}
+		count++
+	}
+	return s
 }
 
 func appendBullet(path, header, text string) error {
@@ -286,6 +366,11 @@ func appendBullet(path, header, text string) error {
 		}
 	}
 
-	_, err = file.WriteString("- " + time.Now().Format(time.RFC3339) + " " + text + "\n")
+	_, err = file.WriteString(bulletLine(text))
 	return err
+}
+
+// bulletLine formats text as a timestamped index bullet, newline included.
+func bulletLine(text string) string {
+	return "- " + time.Now().Format(time.RFC3339) + " " + text + "\n"
 }

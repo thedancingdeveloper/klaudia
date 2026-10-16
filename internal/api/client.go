@@ -7,6 +7,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -55,11 +56,47 @@ const DefaultModel = "claude-opus-5"
 // always pin a specific snapshot via `--model claude-opus-4-8` or
 // `--model claude-opus-4-5-20251101`. Bumped to track the current Claude 4.x
 // lineup — verified live against /v1/messages with a one-shot probe.
+//
+// The aliases deliberately stay on the 5.0 models although Claude Code now
+// defaults to Opus 5.5, Sonnet 5.5 and Fable 5.1. Opus 5.5 and Fable 5.1 bind
+// thinking blocks to the conversation that produced them ("preserved
+// thinking"): for newer accounts, a request whose earlier turns were edited
+// is rejected. Microcompaction and the sanitiser edit earlier turns, so those
+// models are available by full ID (--model claude-opus-5-5) but not yet by
+// alias; moving the aliases waits on making those edits append-only.
 var modelAliases = map[string]string{
 	"haiku":  "claude-haiku-4-5",
 	"sonnet": "claude-sonnet-5",
 	"opus":   "claude-opus-5",
 	"fable":  "claude-fable-5",
+}
+
+// preservedThinkingModels run the API's "preserved thinking" check. A thinking
+// block's signature records the conversation that produced it: the system
+// prompt, the tool set, and every message before the block. When the block is
+// replayed, the API recomputes that record from the request and requires a
+// match, so a request whose earlier turns were edited since fails with a 400
+// (enforced by default for accounts created on or after 2026-08-31) or has the
+// reasoning after the edit dropped. Mythos 5.1 reads the blocks but runs no
+// such check, so it is not listed. The list is the documented one as of
+// 2026-09; Anthropic says later models will enforce the check for everyone.
+var preservedThinkingModels = []string{
+	"claude-fable-5-1",
+	"claude-opus-5-5",
+}
+
+// PreservesThinking reports whether model binds its thinking blocks to the
+// conversation that produced them, so that Klaudia must keep already-sent
+// history append-only when talking to it. Aliases resolve first; a dated
+// snapshot of a listed model ("claude-opus-5-5-20261001") counts as the model.
+func PreservesThinking(model string) bool {
+	id := strings.ToLower(string(ResolveModel(model)))
+	for _, m := range preservedThinkingModels {
+		if id == m || strings.HasPrefix(id, m+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 // modelContextWindows is the offline fallback for the input-token limit, used
@@ -72,6 +109,12 @@ var modelAliases = map[string]string{
 // for the current lineup regardless, so the status bar's `ctx N%` had been
 // overstating context pressure roughly fivefold.
 var modelContextWindows = map[string]int{
+	// Claude Opus 5.5 and Fable 5.1: 1M per the Claude API model reference
+	// (2026-06); Sonnet 5.5: 1M per the Claude Code 2.1.284 release note. Not
+	// probed live — no API credential in the session that added them.
+	"claude-opus-5-5":            1_000_000,
+	"claude-sonnet-5-5":          1_000_000,
+	"claude-fable-5-1":           1_000_000,
 	"claude-opus-5":              1_000_000,
 	"claude-sonnet-5":            1_000_000,
 	"claude-fable-5":             1_000_000,
@@ -122,7 +165,11 @@ const DefaultMaxOutputTokens = 8192
 // cap can't 400. Every 1M-context model generates up to 128k; the 200k-context
 // models up to 64k. Keep this in sync with modelContextWindows.
 var modelMaxOutputTokens = map[string]int{
-	// 1M-context models → 128k output.
+	// 1M-context models → 128k output. Opus 5.5 and Fable 5.1 are documented at
+	// 128k; Sonnet 5.5 is assumed from the 1M → 128k rule above.
+	"claude-opus-5-5":   128000,
+	"claude-sonnet-5-5": 128000,
+	"claude-fable-5-1":  128000,
 	"claude-opus-5":     128000,
 	"claude-sonnet-5":   128000,
 	"claude-fable-5":    128000,
@@ -160,6 +207,67 @@ func ResolveModel(m string) anthropic.Model {
 	return anthropic.Model(m)
 }
 
+// ClaudeProvider reports whether a configured provider name ("" = the default)
+// serves Anthropic's model ids. Only then do the alias, context-window and
+// output-cap tables above describe the model actually being called; an
+// OpenAI-compatible endpoint names its models however it likes, and even one
+// that serves a Claude model under its Anthropic id sets its own limits.
+func ClaudeProvider(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "", "anthropic":
+		return true
+	}
+	return false
+}
+
+// ResolveModelFor is ResolveModel for a configured provider. Aliases and the
+// Claude default apply to Anthropic only: any other provider gets the string
+// it was given, trimmed, and "" stays "" — sending "claude-sonnet-5" to an
+// OpenAI-compatible endpoint because someone typed "sonnet" is not a guess
+// worth making.
+func ResolveModelFor(provider, m string) anthropic.Model {
+	if ClaudeProvider(provider) {
+		return ResolveModel(m)
+	}
+	return anthropic.Model(strings.TrimSpace(m))
+}
+
+// ContextWindowFor is ContextWindow for a configured provider: off Anthropic
+// the per-model table does not apply, so only an explicit override counts.
+func ContextWindowFor(provider, model string, override int) (limit int, source string) {
+	if ClaudeProvider(provider) || override > 0 {
+		return ContextWindow(model, override)
+	}
+	return 0, ContextSourceUnknown
+}
+
+// MaxOutputTokensFor is MaxOutputTokens for a configured provider: off
+// Anthropic every model gets the conservative DefaultMaxOutputTokens.
+func MaxOutputTokensFor(provider, model string) int {
+	if ClaudeProvider(provider) {
+		return MaxOutputTokens(model)
+	}
+	return DefaultMaxOutputTokens
+}
+
+// AliasWarning explains, when model is a bare Claude alias ("sonnet") used with
+// a provider that does not serve Anthropic's ids, that it is sent as written.
+// It returns "" otherwise. Callers show it once, when the model is chosen —
+// not on every turn that re-resolves it.
+func AliasWarning(provider, model string) string {
+	if ClaudeProvider(provider) {
+		return ""
+	}
+	alias := strings.ToLower(strings.TrimSpace(model))
+	full, ok := modelAliases[alias]
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("model %q is a Claude alias, which Klaudia resolves only for the Anthropic provider; "+
+		"provider %q receives it unchanged. Use the model id your endpoint serves (for Anthropic it would have been %s)",
+		strings.TrimSpace(model), strings.TrimSpace(provider), full)
+}
+
 // Client is Klaudia's Anthropic API client: the SDK client plus the resolved
 // credential (so callers know whether they are on the OAuth path).
 type Client struct {
@@ -168,6 +276,21 @@ type Client struct {
 	// httpc is the client the SDK was built with, kept so a stalled stream can
 	// drop its idle connections before retrying — see streamRetrying.
 	httpc *http.Client
+	// baseURL is the custom endpoint the client was built with ("" for the
+	// Anthropic API), kept so a model-not-found error can say where it came
+	// from.
+	baseURL string
+}
+
+// defaultAnthropicEndpoint is what an unset baseURL talks to, named in errors.
+const defaultAnthropicEndpoint = "https://api.anthropic.com"
+
+// endpoint is the base URL requests go to, for error messages.
+func (c *Client) endpoint() string {
+	if c.baseURL != "" {
+		return c.baseURL
+	}
+	return defaultAnthropicEndpoint
 }
 
 // dropIdleConnections discards pooled connections, so the next attempt dials
@@ -259,8 +382,28 @@ func New(cred Credential, baseURL string) *Client {
 	if baseURL != "" {
 		opts = append(opts, option.WithBaseURL(baseURL))
 	}
-	return &Client{sdk: anthropic.NewClient(opts...), cred: cred, httpc: httpc}
+	return &Client{sdk: anthropic.NewClient(opts...), cred: cred, httpc: httpc, baseURL: baseURL}
 }
 
 // IsOAuth reports whether this client authenticates via OAuth bearer token.
 func (c *Client) IsOAuth() bool { return c.cred.IsOAuth() }
+
+// ResolveAnthropicBaseURL picks the base URL for the native Anthropic provider.
+//
+// Precedence (first non-empty wins):
+//  1. configBaseURL          — explicit config.toml `baseURL` (explicit config wins)
+//  2. KLAUDIA_CUSTOM_ENDPOINT — the --custom-endpoint override
+//  3. ANTHROPIC_BASE_URL      — the standard Anthropic env var (beats the default)
+//  4. ""                      — the Anthropic production API
+func ResolveAnthropicBaseURL(configBaseURL string) string {
+	if s := strings.TrimSpace(configBaseURL); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(os.Getenv("KLAUDIA_CUSTOM_ENDPOINT")); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL")); s != "" {
+		return s
+	}
+	return ""
+}

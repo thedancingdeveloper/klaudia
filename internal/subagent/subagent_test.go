@@ -10,6 +10,14 @@ import (
 	"github.com/greenthread-ai/klaudia/internal/tools"
 )
 
+func TestIsolationVocabularyMatchesTheTool(t *testing.T) {
+	if IsolationAuto != tools.IsolationAuto || IsolationWorktree != tools.IsolationWorktree || IsolationShared != tools.IsolationShared {
+		t.Fatalf("type consts (%q %q %q) differ from the tool's (%q %q %q)",
+			IsolationAuto, IsolationWorktree, IsolationShared,
+			tools.IsolationAuto, tools.IsolationWorktree, tools.IsolationShared)
+	}
+}
+
 func TestBuiltinLookup(t *testing.T) {
 	for _, name := range []string{"general-purpose", "Explore", "Plan"} {
 		if _, ok := Lookup(name); !ok {
@@ -18,6 +26,28 @@ func TestBuiltinLookup(t *testing.T) {
 	}
 	if _, ok := Lookup("nope"); ok {
 		t.Error("unexpected type found")
+	}
+}
+
+// MayWrite decides whether a background instance needs an isolated worktree:
+// the wildcard general-purpose can write, the read-only types cannot.
+func TestMayWrite(t *testing.T) {
+	gp, _ := Lookup("general-purpose")
+	if !gp.MayWrite() {
+		t.Error("general-purpose (wildcard toolset) should be a writer")
+	}
+	for _, name := range []string{"Explore", "Plan"} {
+		ty, _ := Lookup(name)
+		if ty.MayWrite() {
+			t.Errorf("%s is read-only and must not be treated as a writer", name)
+		}
+	}
+	// An explicit mutating tool marks a type a writer even without the wildcard.
+	if !(Type{Tools: []string{"Read", "Edit"}}).MayWrite() {
+		t.Error("a type granted Edit should be a writer")
+	}
+	if (Type{Tools: []string{"Read", "Grep"}}).MayWrite() {
+		t.Error("a purely read/search type should not be a writer")
 	}
 }
 

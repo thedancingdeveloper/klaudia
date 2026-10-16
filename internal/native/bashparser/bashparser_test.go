@@ -1,6 +1,9 @@
 package bashparser
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func TestParsePrefix(t *testing.T) {
 	cases := []struct {
@@ -151,4 +154,102 @@ func equal(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestParseBackground(t *testing.T) {
+	for in, want := range map[string][]bool{
+		"a &":               {true},
+		"a & b":             {true, false},
+		"(a &) ; b":         {true, false},
+		"(a; b) &":          {true, true},
+		"a | b &":           {true, true},
+		"a && b":            {false, false},
+		"a 2>&1":            {false},
+		"a >&2":             {false},
+		"a &> log":          {false},
+		"a &>> log":         {false},
+		"echo 'x & y'":      {false},
+		`echo "x & y"`:      {false},
+		"a & b & wait":      {true, true, false},
+		"if a; then b & fi": {false, true},
+	} {
+		a, err := Parse(in)
+		if err != nil {
+			t.Errorf("Parse(%q): %v", in, err)
+			continue
+		}
+		var got []bool
+		for _, c := range a.Commands {
+			got = append(got, c.Background)
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("Parse(%q) backgrounds = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestSequential(t *testing.T) {
+	type cmd struct {
+		chain int
+		start bool
+	}
+	cases := []struct {
+		line string
+		seq  bool
+		want []cmd // per command, when seq
+	}{
+		{"cd a && git add -A", true, []cmd{{0, true}, {0, false}}},
+		{"cd a; git add -A", true, []cmd{{0, true}, {1, true}}},
+		{"cd a\ngit add -A && git commit -m x", true, []cmd{{0, true}, {1, true}, {1, false}}},
+		{"false && cd a; git add -A", true, []cmd{{0, true}, {0, false}, {1, true}}},
+		{"cd a || exit; git add -A", false, nil},
+		{"(cd a && git add -A); git add -A", false, nil},
+		{"{ cd a; }; git add -A", false, nil},
+		{"cd a | git add -A", false, nil},
+		{"cd a & git add -A", false, nil},
+		{"! cd a; git add -A", false, nil},
+		{"if true; then cd a; fi; git add -A", false, nil},
+		{"f() { cd a; }; git add -A", false, nil},
+		{"echo $(cd a); git add -A", false, nil},
+		// A cd on any side of a pipe must break Sequential: without
+		// `shopt -s lastpipe` (non-default) the final side of a pipe runs in
+		// a subshell, but we do not model the shopt, so fail closed.
+		{"true | cd a && git add -A", false, nil},
+		{"true | eval x && git add -A", false, nil},
+		{"true | builtin cd a && git add -A", false, nil},
+		{"true | X=1 && git add -A", false, nil},
+		{"true | $X && git add -A", false, nil},
+		// A pipe of ordinary programs cannot move this shell whichever side
+		// runs here, so it stays in the chain and a cd before it is followed
+		// (#289).
+		{"cd a && git add -A 2>&1 | tail -3", true, []cmd{{0, true}, {0, false}, {0, false}}},
+		{"cd a && git status | head && git add -A", true, []cmd{{0, true}, {0, false}, {0, false}, {0, false}}},
+		// `${ …; }` and `${| …; }` substitutions run in the current shell
+		// (unlike `$( … )`, a true subshell), so a cd inside them really
+		// moves the parent shell's working directory.
+		{"${ cd a; }; git add -A", false, nil},
+		{"${|cd a;}; git add -A", false, nil},
+		{"echo ${ eval 'cd a'; }; git add -A", false, nil},
+	}
+	for _, tc := range cases {
+		a, err := Parse(tc.line)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.line, err)
+		}
+		if a.Sequential != tc.seq {
+			t.Errorf("Parse(%q).Sequential = %v, want %v", tc.line, a.Sequential, tc.seq)
+			continue
+		}
+		if !tc.seq {
+			continue
+		}
+		if len(a.Commands) != len(tc.want) {
+			t.Fatalf("Parse(%q): %d commands, want %d", tc.line, len(a.Commands), len(tc.want))
+		}
+		for i, w := range tc.want {
+			if c := a.Commands[i]; c.Chain != w.chain || c.ChainStart != w.start {
+				t.Errorf("Parse(%q) command %d (%s): chain %d start %v, want %d %v", tc.line, i, c.Name, c.Chain, c.ChainStart, w.chain, w.start)
+			}
+		}
+	}
 }

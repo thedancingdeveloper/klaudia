@@ -1,0 +1,398 @@
+package agent
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/anthropics/anthropic-sdk-go"
+
+	"github.com/greenthread-ai/klaudia/internal/tools"
+)
+
+// Background sub-agents.
+//
+// The synchronous Agent tool blocks the parent turn until the child returns —
+// right for a quick fan-out, wrong for a twenty-minute investigation the user
+// would rather not sit behind. A background sub-agent returns a handle at once;
+// the parent keeps working, and the child's result is delivered on a later turn
+// (CollectBackground, polled by the loop) and listed live by the /agents view.
+//
+// This mirrors how an async agent is reported here: launched, tracked by id and
+// status, and surfaced back when it finishes rather than awaited inline.
+
+// BackgroundStatus is where a background sub-agent is in its life.
+type BackgroundStatus string
+
+const (
+	// BackgroundRunning: the child loop is still going.
+	BackgroundRunning BackgroundStatus = "running"
+	// BackgroundSucceeded: it returned a result.
+	BackgroundSucceeded BackgroundStatus = "succeeded"
+	// BackgroundFailed: it errored (spawn, worktree, or the loop itself).
+	BackgroundFailed BackgroundStatus = "failed"
+)
+
+// BackgroundAgent is a snapshot of one background sub-agent, safe to hand to a
+// frontend: it is a copy, so reading it never races the registry's writers.
+type BackgroundAgent struct {
+	ID    string
+	Type  string
+	Label string // the task description the model gave, for the status view
+	// Name is the caller's handle for this child (the Agent tool's name
+	// input). "" means none. It is unique in the session; the registry id
+	// is still what delivery uses.
+	Name       string
+	Status     BackgroundStatus
+	StartedAt  time.Time
+	FinishedAt time.Time // zero while running
+	Activity   string    // last tool the child ran, for a live status line
+	Result     string    // final text, once succeeded
+	Err        string    // error text, once failed
+	// Usage is what the child spent, nil until it made a request. The parent
+	// folds it in when the result is delivered.
+	Usage    *tools.ChildUsage
+	Isolated bool // ran in its own git worktree (a writer) vs shared tree
+	// Provenance names the repository, branch and HEAD the child was cut
+	// from ("<repo> on <branch> at <head>"). "" when that is not a repository.
+	Provenance string
+	// Background is false for a foreground child: it blocks the parent turn,
+	// so it is never delivered through TakeFinishedFor, but it is listed and
+	// cancellable like any other child.
+	Background bool
+	// Conversation is the Turn.Conversation of the turn that launched it: the
+	// one conversation its result is delivered to. "" for a frontend with only
+	// one conversation (TUI, stream-json, -p).
+	Conversation string
+}
+
+// Elapsed is how long the agent has run: to completion if finished, else so far.
+func (a BackgroundAgent) Elapsed() time.Duration {
+	end := a.FinishedAt
+	if end.IsZero() {
+		end = time.Now()
+	}
+	return end.Sub(a.StartedAt)
+}
+
+// Done reports whether the agent has stopped running.
+func (a BackgroundAgent) Done() bool { return a.Status != BackgroundRunning }
+
+// BackgroundRegistry tracks background sub-agents launched from one session.
+//
+// It is shared between the goroutines running the children, the Agent tool that
+// launches them, the loop that collects their results, and the /agents view
+// that lists them — so every access is under the mutex, and List/Get/Snapshot
+// hand back copies rather than the live pointers.
+type BackgroundRegistry struct {
+	mu        sync.Mutex
+	seq       int
+	events    map[string][]Event // keyed by conversation: one process runs several
+	byID      map[string]*backgroundEntry
+	order     []string
+	delivered map[string]bool // ids whose result has been delivered to the parent
+	clock     func() time.Time
+}
+
+// backgroundEntry is the registry's mutable record; BackgroundAgent is its
+// snapshot. cancel stops the child's context (wired by SpawnBackground).
+type backgroundEntry struct {
+	agent  BackgroundAgent
+	cancel func()
+}
+
+// NewBackgroundRegistry builds an empty registry.
+func NewBackgroundRegistry() *BackgroundRegistry {
+	return &BackgroundRegistry{
+		byID:      map[string]*backgroundEntry{},
+		delivered: map[string]bool{},
+		clock:     time.Now,
+	}
+}
+
+func (r *BackgroundRegistry) now() time.Time {
+	if r.clock != nil {
+		return r.clock()
+	}
+	return time.Now()
+}
+
+// register adds a running agent and returns its assigned id. cancel is stored so
+// the entry can be stopped later; it may be nil. conversation is the launching
+// turn's Turn.Conversation, which scopes delivery (see TakeFinishedFor).
+// provenance is the one-line repo/branch/HEAD the child was cut from.
+// background is false for a foreground child, which is tracked but never
+// delivered as a background result.
+func (r *BackgroundRegistry) register(conversation, subagentType, label string, isolated bool, provenance string, background bool, cancel func()) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seq++
+	id := fmt.Sprintf("agent-%d", r.seq)
+	r.byID[id] = &backgroundEntry{
+		agent: BackgroundAgent{
+			ID:           id,
+			Type:         subagentType,
+			Label:        label,
+			Status:       BackgroundRunning,
+			StartedAt:    r.now(),
+			Isolated:     isolated,
+			Provenance:   provenance,
+			Background:   background,
+			Conversation: conversation,
+		},
+		cancel: cancel,
+	}
+	r.order = append(r.order, id)
+	r.recordEvent(conversation, Event{Type: "subagent_started", ToolUseID: id, ToolName: subagentType, Text: label})
+	return id
+}
+
+// registerNamed is register with a caller-supplied name. The name is a label
+// on the registry id, not a second id: delivery still keys on agent-N. An
+// empty name is an ordinary register. A name already held by a child that
+// is still running in this conversation is refused, so two children cannot
+// answer to one handle at once. A finished child, or one in another
+// conversation, does not hold the name.
+func (r *BackgroundRegistry) registerNamed(conversation, subagentType, name, label string, isolated bool, provenance string, background bool, cancel func()) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if name != "" {
+		for _, e := range r.byID {
+			if e.agent.Name == name && e.agent.Conversation == conversation && e.agent.Status == BackgroundRunning {
+				return "", fmt.Errorf("a sub-agent named %q is already running in this conversation", name)
+			}
+		}
+	}
+	r.seq++
+	id := fmt.Sprintf("agent-%d", r.seq)
+	r.byID[id] = &backgroundEntry{
+		agent: BackgroundAgent{
+			ID:           id,
+			Type:         subagentType,
+			Name:         name,
+			Label:        label,
+			Status:       BackgroundRunning,
+			StartedAt:    r.now(),
+			Isolated:     isolated,
+			Provenance:   provenance,
+			Background:   background,
+			Conversation: conversation,
+		},
+		cancel: cancel,
+	}
+	r.order = append(r.order, id)
+	r.recordEvent(conversation, Event{Type: "subagent_started", ToolUseID: id, ToolName: subagentType, Text: label})
+	return id, nil
+}
+
+// recordEvent appends a lifecycle event to one conversation's queue. The
+// caller holds r.mu. Events are per conversation because the registry is per
+// process and an ACP server runs several conversations in one: session A's
+// child must not surface in session B's stream.
+func (r *BackgroundRegistry) recordEvent(conversation string, ev Event) {
+	if r.events == nil {
+		r.events = map[string][]Event{}
+	}
+	r.events[conversation] = append(r.events[conversation], ev)
+}
+
+// TakeEvents returns the lifecycle events recorded for conversation since the
+// last call, in order, and no other conversation's.
+func (r *BackgroundRegistry) TakeEvents(conversation string) []Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := r.events[conversation]
+	delete(r.events, conversation)
+	return out
+}
+
+// collected marks an agent's result as already delivered, so TakeFinishedFor
+// and Undelivered skip it. A foreground child's result goes back through the
+// tool result, and collecting it here stops it being reported twice.
+func (r *BackgroundRegistry) collected(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.delivered[id] = true
+}
+func (r *BackgroundRegistry) setActivity(id, activity string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.byID[id]; ok {
+		e.agent.Activity = activity
+	}
+}
+
+// finish records a terminal outcome. A non-nil err marks the agent failed even
+// when result is non-empty (a partial answer plus an error is still a failure).
+func (r *BackgroundRegistry) finish(id, result string, usage *tools.ChildUsage, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.byID[id]
+	if !ok {
+		return
+	}
+	e.agent.FinishedAt = r.now()
+	e.agent.Usage = usage
+	status := "succeeded"
+	if err != nil {
+		status = "failed"
+		e.agent.Status = BackgroundFailed
+		e.agent.Err = err.Error()
+		e.agent.Result = result
+	} else {
+		e.agent.Status = BackgroundSucceeded
+		e.agent.Result = result
+	}
+	r.recordEvent(e.agent.Conversation, Event{Type: "subagent_finished", ToolUseID: id, ToolName: e.agent.Type, Text: status})
+}
+
+// Get returns a snapshot of one agent.
+func (r *BackgroundRegistry) Get(id string) (BackgroundAgent, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.byID[id]
+	if !ok {
+		return BackgroundAgent{}, false
+	}
+	return e.agent, true
+}
+
+// List returns snapshots of every agent in launch order.
+func (r *BackgroundRegistry) List() []BackgroundAgent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]BackgroundAgent, 0, len(r.order))
+	for _, id := range r.order {
+		out = append(out, r.byID[id].agent)
+	}
+	return out
+}
+
+// Cancel stops a running agent's context. Returns false if it is unknown or
+// already finished.
+func (r *BackgroundRegistry) Cancel(id string) bool {
+	r.mu.Lock()
+	e, ok := r.byID[id]
+	if !ok || e.agent.Done() || e.cancel == nil {
+		r.mu.Unlock()
+		return false
+	}
+	cancel := e.cancel
+	r.mu.Unlock()
+	cancel()
+	return true
+}
+
+// TakeFinished returns the finished agents not yet collected for the default
+// conversation (""). See TakeFinishedFor.
+func (r *BackgroundRegistry) TakeFinished() []BackgroundAgent { return r.TakeFinishedFor("") }
+
+// TakeFinishedFor returns the finished agents launched from conversation that
+// have not been collected yet, marking them collected so each result is
+// delivered to the parent exactly once. The loop polls this between turns; the
+// /agents view uses List instead so it keeps showing finished agents.
+//
+// Scoped by conversation because the registry is per process and an ACP
+// server runs several conversations in one: an agent launched from one editor
+// thread must not report into another.
+func (r *BackgroundRegistry) TakeFinishedFor(conversation string) []BackgroundAgent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []BackgroundAgent
+	// Deliver in the order they were launched, for a stable report.
+	for _, id := range r.order {
+		e := r.byID[id]
+		if e.agent.Conversation == conversation && e.agent.Background && e.agent.Done() && !r.delivered[id] {
+			r.delivered[id] = true
+			out = append(out, e.agent)
+		}
+	}
+	return out
+}
+
+// Undelivered returns the agents launched from conversation whose result has
+// not reached the parent yet: the ones still running and the ones that have
+// finished but not been collected. A headless run uses it to decide whether it
+// can exit (see cli's drainBackground).
+func (r *BackgroundRegistry) Undelivered(conversation string) (running, ready []BackgroundAgent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, id := range r.order {
+		e := r.byID[id]
+		if e.agent.Conversation != conversation || !e.agent.Background || r.delivered[id] {
+			continue
+		}
+		if e.agent.Done() {
+			ready = append(ready, e.agent)
+		} else {
+			running = append(running, e.agent)
+		}
+	}
+	return running, ready
+}
+
+// PendingReport formats the newly-finished background agents of the default
+// conversation (""). See PendingReportFor.
+func (r *BackgroundRegistry) PendingReport() string {
+	s, _ := r.PendingReportFor("")
+	return s
+}
+
+// PendingReportFor formats the newly-finished background agents launched from
+// conversation as a user message for the parent loop, or "" when none are
+// pending. The usage is what those children spent, for the caller to fold
+// into its totals. Wiring this to Options.CollectBackground is what turns
+// "launched in the background" into "delivered when ready".
+func (r *BackgroundRegistry) PendingReportFor(conversation string) (string, []*tools.ChildUsage) {
+	finished := r.TakeFinishedFor(conversation)
+	if len(finished) == 0 {
+		return "", nil
+	}
+	var usage []*tools.ChildUsage
+	for _, a := range finished {
+		if a.Usage != nil {
+			usage = append(usage, a.Usage)
+		}
+	}
+	var b strings.Builder
+	b.WriteString("Background sub-agent(s) you launched earlier have finished. " +
+		"Their results are below; fold anything useful into your work.\n")
+	for _, a := range finished {
+		fmt.Fprintf(&b, "\n[%s · %s · %s", a.ID, a.Type, a.Status)
+		if a.Label != "" {
+			fmt.Fprintf(&b, " · %s", a.Label)
+		}
+		b.WriteString("]\n")
+		switch a.Status {
+		case BackgroundFailed:
+			b.WriteString("failed: " + a.Err + "\n")
+			if a.Result != "" {
+				b.WriteString(a.Result + "\n")
+			}
+		default:
+			if a.Result != "" {
+				b.WriteString(a.Result + "\n")
+			} else {
+				b.WriteString("(no output)\n")
+			}
+		}
+	}
+	return strings.TrimRight(b.String(), "\n"), usage
+}
+
+// pollBackground reads any finished-agent report, if the caller wired a source.
+func pollBackground(opts Options) string {
+	if opts.CollectBackground == nil {
+		return ""
+	}
+	return opts.CollectBackground()
+}
+
+// backgroundMessage renders a finished-agent report as a user message.
+func backgroundMessage(report string) (anthropic.BetaMessageParam, bool) {
+	if strings.TrimSpace(report) == "" {
+		return anthropic.BetaMessageParam{}, false
+	}
+	return anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(report)), true
+}

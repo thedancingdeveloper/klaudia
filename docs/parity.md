@@ -6,13 +6,19 @@ the port and has now been **retired to the `js-reference` branch** — the Go
 binary is the product. This table is the record of what was ported and where it
 deliberately diverges.
 
+Parity was the method, not the destination. It was how the port was kept honest
+while the JS tree was still there to diff against; it stopped being a goal the
+moment the reference was retired. A 🔀 row is therefore a finished decision, not
+an outstanding one — where a whole area has been redesigned rather than ported
+(permissions, most visibly) the section says so in prose above its table.
+
 **Status legend**
 
 | Status | Meaning |
 | --- | --- |
 | ✅ done | Ported, tested, behaviourally equivalent to the JS reference. |
 | 🟡 partial | Ported but narrower than JS (gaps noted). |
-| 🔀 divergent | Intentionally differs from JS (a deliberate Klaudia design choice). |
+| 🔀 divergent | Intentionally differs from JS (a settled Klaudia design choice, including features deliberately removed). |
 | ⛔ skipped | Not ported and not planned (with rationale). |
 | 🔜 planned | On the current plan, not yet implemented. |
 
@@ -27,7 +33,7 @@ framework), `05-app-core` (agent loop/tools), `06-app-ui` (TUI screens),
 
 | Feature | JS ref | Klaudia pkg | Status | Notes |
 | --- | --- | --- | --- | --- |
-| Read (text) | 05-app-core | `tools/read.go` | ✅ done | Line range, cat -n format; directory → clean error. |
+| Read (text) | 05-app-core | `tools/read.go` | ✅ done | Line range, cat -n format; notice when the window stops short of EOF; binary (NUL in first 8 KB) → size only; directory → clean error. |
 | Read (image) | 05-app-core | `tools/read.go` | ✅ done | Returns `ResultImage`; flows to vision via `toolResultWithImages`. |
 | Read (PDF) | 05-app-core | `tools/read.go` + `native/pdf` | 🔀 divergent | Pure-Go text extraction via gopdf (JS rendered pages to images for the model). |
 | Write | 05-app-core | `tools/write.go` | ✅ done | |
@@ -36,7 +42,7 @@ framework), `05-app-core` (agent loop/tools), `06-app-ui` (TUI screens),
 | Grep | 05-app-core | `tools/grep.go` + `native/search` | ✅ done | ripgrep-style; pure-Go backend. |
 | Bash | 05-app-core | `tools/bash.go` + `sandbox/` | ✅ done | local / os-confined / container executors. |
 | Bash run_in_background + BashOutput / KillShell | 05-app-core | `tools/bash.go`, `tools/shells.go` + `sandbox` | ✅ done | Bash `run_in_background` returns a shell id; BashOutput reads new output incrementally (optional regex filter); KillShell stops it. Session-scoped store; all shells killed at session end. Works across all executors via `Executor.Argv`. |
-| Code intelligence (LSP) | — | `lsp/` + `tools/lsp_tools.go` | 🔀 divergent | New capability with no JS analogue: Diagnostics/Definition/References via language servers detected on PATH + toolchain dirs (gopls/rust-analyzer/tsserver/pyright/clangd). Lazy-spawned, session-scoped, never downloaded. |
+| Code intelligence (LSP) | — | `lsp/` + `tools/lsp_tools.go` | 🔀 divergent | New capability with no JS analogue: Diagnostics/Definition/References/WorkspaceSymbol via language servers detected on PATH + toolchain dirs (gopls/rust-analyzer/tsserver/pyright/clangd). Lazy-spawned, session-scoped, never downloaded. |
 | TodoWrite | 05-app-core | `tools/todowrite.go` | ✅ done | |
 | Task tools (Create/List/Get/Update) | 07-app-features | `tools/task*.go` + `tasks/` | ✅ done | |
 | NotebookEdit | 05-app-core | `tools/notebookedit.go` | ✅ done | |
@@ -46,19 +52,25 @@ framework), `05-app-core` (agent loop/tools), `06-app-ui` (TUI screens),
 | Memory | 07-app-features | `tools/memory.go` + `memory/` | 🔀 divergent | Auto-memory + recall via `.klaudia/memory/`. |
 | ToolSearch (deferred loading) | 07-app-features | `tools/toolsearch.go` | ✅ done | Per-turn `buildToolParams` filter + `Context.Reveal`. |
 | SlashCommand (model-invoked) | 07-app-features | `tools/skill.go` | 🔀 divergent | Covered by the Skill tool (user-defined skills the model can invoke). |
-| BrowserSearch / BrowserFetch / browser navigation | 03-providers / 05 | `tools/browsersearch.go`, `tools/browserfetch.go`, `tools/browser.go`, `browser/` | 🟡 partial | Local default tools use lazy Chrome + DDG/Google and rendered markdown; search can relaunch headed Chrome with persistent `~/.klaudia/browser/chrome-profile` for user-assisted challenge handling. Permission-gated (ask by default; denied in plan/dontAsk); the engine is session-owned and Closed on exit. Navigation waits for the DOM to settle (readyState + text-stable, bounded) so JS-rendered content is captured. Google parsing filters Google's own nav/account links (DDG remains the stable default). Anthropic server-side betas still available via `agent/webtools.go`. |
+| BrowserSearch / BrowserFetch / browser navigation | 03-providers / 05 | `tools/browsersearch.go`, `tools/browserfetch.go`, `tools/browser.go`, `browser/` | 🟡 partial | Local default tools use lazy Chrome + DDG/Google and rendered markdown; search can relaunch headed Chrome with persistent `~/.klaudia/browser/chrome-profile` for user-assisted challenge handling. Permission-gated (allowed in autonomous; denied in plan); the engine is session-owned and Closed on exit. Navigation waits for the DOM to settle (readyState + text-stable, bounded) so JS-rendered content is captured. Google parsing filters Google's own nav/account links (DDG remains the stable default). Anthropic server-side betas still available via `agent/webtools.go`. |
 
 ## Agent loop & streaming
 
 | Feature | JS ref | Klaudia pkg | Status | Notes |
 | --- | --- | --- | --- | --- |
 | Agentic tool loop | 05-app-core | `agent/loop.go` | ✅ done | Emitter, per-turn tool params, Approver/Asker/Planner seams. |
+| Permission mode in the prompt | — | `agent/mode.go` | 🔀 divergent | The active mode is a system-prompt clause rebuilt per turn (approving a plan flips it mid-run), appended as a separate block so the cached prefix stays stable. Autonomous adds nothing. Changes emit a `permission_mode` event for headless frontends. |
+| Parallel tool dispatch | 05-app-core | `agent/dispatchgroup.go` | ✅ done | Adjacent `tools.ConcurrencySafe` calls run together, 5 at a time. Groups are maximal runs so nothing is reordered; a call whose gate or permission check would ask is never grouped (one `Approver`, one prompt at a time); a group's events are delivered in call order with the head streaming live. `Read`/`Glob`/`Grep` are marked. |
+| Per-message tool-result cap | 05-app-core | `agent/batchcap.go` | 🔀 divergent | One turn's combined tool-result text held to 200 KB, on top of the 30 KB per-result cap. Shares are water-filled, not split evenly; images and an existing spill notice are left alone. See `docs/compaction.md`. |
 | Provider abstraction | 03-providers | `api/provider.go` | 🔀 divergent | Multi-provider interface (Anthropic + OpenAI-compatible); JS was Anthropic-centric. |
 | Anthropic Messages (Beta, streaming) | 02/03 | `api/client.go` | ✅ done | Streamed with an idle watchdog (`KLAUDIA_STREAM_IDLE_TIMEOUT`). |
 | OpenAI-compatible Chat Completions | — | `api/openai*.go` | 🔀 divergent | Translation shim; SSE stream:true. Image tool_results translated to `image_url` content parts. |
 | Prompt caching | 03-providers | `api/cache.go` | ✅ done | `cache_control` breakpoints on tools + system + a rolling conversation tail; usage surfaced as `cache_read/creation_input_tokens`. Disable with `KLAUDIA_DISABLE_PROMPT_CACHE`. |
 | stream-json output (authoritative envelope) | 08-entry | `streamjson/` + `cli/envelope.go` | ✅ done | |
 | stream-json partial deltas | 08-entry | `cli/partial.go` + `api/StreamSink` | ✅ done | Behind `--include-partial-messages`; emits JS `stream_event` lines. OpenAI shim synthesizes the sequence. |
+| stream-json control requests | 08-entry | `streamjson/driver.go` | 🔀 divergent | `can_use_tool` is the JS subtype; `ask_user` and `exit_plan` are added, because without them AskUserQuestion and ExitPlanMode were dead over the one channel whose purpose is a client with a user in front of it. The ask also carries `tool_use_id`, specifier, suggestion and the host change, which the JS payload omits. |
+| Agent Client Protocol (ACP) v1 | — | `acp/` | 🔀 divergent | New capability with no JS analogue: `--input-format acp` serves ACP over stdio for Zed / `acp.nvim` / JetBrains. Sessions and modes map onto Klaudia's own (ACP session ids *are* transcript ids; the mode picker is `/mode`, per thread) and skills become the client's commands; `TodoWrite` becomes a native plan and Edit/Write carry diffs. `fs/read_text_file` is used (unsaved buffers), while client-side writes, `terminal/*` and `session/delete` are declined. See `docs/acp.md`. |
+| One frontend contract (`agent.Turn`) | — | `agent/turn.go` | 🔀 divergent | TUI, stream-json and ACP all run turns through one struct instead of a per-frontend `RunFunc`. A capability is a field a frontend sets; the old positional signatures made "does not support it" indistinguishable from "was never wired". |
 
 ## Sessions, compaction, persistence
 
@@ -73,11 +85,20 @@ framework), `05-app-core` (agent loop/tools), `06-app-ui` (TUI screens),
 
 ## Permissions
 
+Parity was abandoned here on purpose, so read this section differently from the
+rest. The JS permission model — five modes plus allow/deny rule matching — was
+ported faithfully, shipped, and then **removed** once `trust/` existed, because
+two overlapping gates asking about the same tool call is worse than either one
+alone. The rows below record what JS had and what replaced it, not a gap to be
+closed. `docs/trust.md` is the design record.
+
 | Feature | JS ref | Klaudia pkg | Status | Notes |
 | --- | --- | --- | --- | --- |
-| 5 permission modes | 07-app-features | `permission/` | ✅ done | default/acceptEdits/bypassPermissions/plan/dontAsk. |
-| Allow/deny rule matching | 07-app-features | `permission/` | ✅ done | e.g. `Bash(git status:*)`. |
-| Persisted rules in config | 07-app-features | `config/` | ✅ done | |
+| 5 permission modes | 07-app-features | `permission/` | 🔀 divergent | Four, not five: autonomous/acceptEdits/plan/bypassPermissions. default/dontAsk asked the user to take a stance on tool categories; zones answer that instead. acceptEdits is Claude Code's, without allow rules (docs/trust.md). |
+| Allow/deny rule matching | 07-app-features | `permission/` | 🔀 divergent | Removed. Replaced by the host gate + session-scoped approvals: `/trust` grants by what an operation does, not by matching command text. `--allowedTools`/`--disallowedTools` went with it. |
+| Persisted rules in config | 07-app-features | `config/` | 🔀 divergent | Removed with the rules. `[permissions]` keeps only `mode`; there is no `[trust]` section. Grants are session-scoped by design — a trust decision made for one task should not silently outlive it. |
+| Host-change gate (zones, grants, ledger) | — | `agent/hostgate.go` + `trust/` | 🔀 divergent | New capability with no JS analogue: classifies a call by what it would change (project / user files / the machine) and asks only when it leaves the working tree. |
+| Lifecycle hooks | 07-app-features | `hooks/` + `agent/hooks.go` | 🔀 divergent | Four events (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse) against Claude Code's thirty-plus; Stop/SubagentStop deliberately absent. Claude Code's stdin field names and exit-2-blocks convention are kept so existing hook scripts run unedited. PreToolUse runs *after* the host gate, so a hook can narrow but never widen. Hooks declared in a project's config are confirmed once per fingerprinted set; editing the set re-asks. See `docs/hooks.md`. |
 
 ## MCP & sub-agents
 
@@ -86,9 +107,13 @@ framework), `05-app-core` (agent loop/tools), `06-app-ui` (TUI screens),
 | MCP stdio client | 07-app-features | `mcp/` | ✅ done | `.mcp.json` + `.klaudia/.mcp.json` override. |
 | MCP tools wrapped (`mcp__*`) | 07-app-features | `mcp/` + `cli/` | ✅ done | Auto-deferred behind ToolSearch. |
 | MCP reconnect/disconnect (`/mcp`) | — | `mcp.Manager` + `tui` | 🔀 divergent | Interactive `/mcp` picker; reconnect swaps the live session into the existing tool wrappers so a crashed server's tools resume. |
-| MCP HTTP/SSE transports | 07-app-features | `mcp/mcp.go` | ✅ done | A server with `url` uses the streamable HTTP transport (or `type:"sse"`); `command` stays stdio. Custom auth headers are a growth point. |
+| MCP self-healing | — | `mcp.Manager.revive` | 🔀 divergent | A call that fails on the wire probes the server and relaunches it if it has stopped answering. The probe decides, so a bad argument cannot restart a healthy server. Read-only tools are retried; anything else is reported with the ambiguity stated, since the call may have run before the server died. Serialised per server, one attempt per 15s. |
+| MCP HTTP/SSE transports | 07-app-features | `mcp/mcp.go` | ✅ done | A server with `url` uses the streamable HTTP transport (or `type:"sse"`); `command` stays stdio. Custom auth headers are a growth point. SSE is deprecated by the spec — `/doctor` warns when a server is still on it. |
+| MCP elicitation (form) | — | `mcp/elicit.go` | 🔀 divergent | Protocol 2026-07-28. Form elicitation only, advertised as such, and only in an interactive session; URL mode is declined because a terminal cannot open a link out of band. One question per schema field through the same prompt `AskUserQuestion` uses; a type that will not coerce cancels rather than guessing. Serialised, because the SDK fulfils one round's requests concurrently and the frontend has a single question slot. |
+| MCP sampling / roots / logging | 07-app-features | — | ⛔ not planned | All three are deprecated as of protocol 2026-07-28 (SEP-2577). Roots was never populated, so the capability is no longer advertised either. |
 | Built-in sub-agents | 07-app-features | `subagent/` | ✅ done | |
-| Sub-agent tool allowlists (`Type.Filter`) | 07-app-features | `subagent/` | ✅ done | Explore/Plan are restricted to read-only Read/Glob/Grep; general-purpose gets the full toolset by design. |
+| Sub-agent tool allowlists (`Type.Filter`) | 07-app-features | `subagent/` | ✅ done | Explore/Plan are restricted to read-only Read/Glob/Grep; general-purpose gets the full toolset by design, less AskUserQuestion, with TodoWrite on a store of its own. |
+| Sub-agent working-tree isolation | — | `worktree/` + `agent/spawner.go` | 🔀 divergent | New capability with no JS analogue: a sub-agent whose toolset can write gets its own `git worktree` under `~/.klaudia/worktrees/`, seeded with the parent's uncommitted work (not HEAD) and adopted back with `git apply` — index untouched, conflicts named to both the user and the model. Explore/Plan share the tree. Off with `[subagents] worktree = false`. See `docs/working-tree.md`. |
 
 ## TUI & frontends
 
@@ -96,9 +121,9 @@ framework), `05-app-core` (agent loop/tools), `06-app-ui` (TUI screens),
 | --- | --- | --- | --- | --- |
 | Interactive TUI | 04/06 | `tui/` | 🔀 divergent | Bubble Tea (JS was React+Ink). Single-reader invariant. |
 | Headless `-p` / `--print` | 08-entry | `cli/` | ✅ done | text / json / stream-json. |
-| stream-json input (embedding frontend) | 08-entry | `cli/` + `streamjson/` | ✅ done | `--input-format stream-json`. |
+| stream-json input (embedding frontend) | 08-entry | `cli/` + `streamjson/` | ✅ done | `--input-format stream-json`. Inbound control requests: `interrupt`, `set_permission_mode`, `set_model`, `initialize`. Not yet: image blocks in user input, `updatedInput` on an allow, `total_cost_usd` (#122, #150). |
 | @ file autocomplete | 06-app-ui | `tui/tui.go` | 🔀 divergent | Tab-completes the trailing @<path> token (robust completion vs. JS live overlay). |
-| Slash command type-ahead | 06-app-ui | `tui/tui.go` | ✅ done | Live suggestions as you type `/…`; Tab completes (unique → fill, many → common prefix). |
+| Slash command type-ahead | 06-app-ui | `tui/tui.go` | ✅ done | Live suggestions as you type `/…`; Tab completes (unique → fill, many → common prefix), and after `/<cmd> ` completes its argument where the command has a completer (`tui/argcomplete.go`). |
 | Bracketed paste / drag-drop | 06-app-ui | bubbletea default | ✅ done | Bracketed paste on by default (multi-line pastes atomic). |
 | Help bar / keymap / input history | 06-app-ui | `tui/tui.go` | ✅ done | Up/Down ring-buffer history, Tab completion, key hints; /help generated from one command table. |
 | Scrollback | 06-app-ui | terminal-native (inline render) | ✅ done | Output is printed into the terminal's own scrollback via `tea.Println`; no alt-screen and no mouse capture, so scrolling, selection, search and tmux copy mode are the terminal's. `/search`, `/outline`, `/errors` add structured lookup on top. |
@@ -118,9 +143,9 @@ framework), `05-app-core` (agent loop/tools), `06-app-ui` (TUI screens),
 | /memory | `tui/tui.go` | ✅ done | |
 | /mcp | `tui/tui.go` | ✅ done | |
 | /stats, /status | `tui/tui.go` | ✅ done | |
-| /allow, /deny | `tui/tui.go` | ✅ done | |
+| /allow, /deny | — | 🔀 divergent | Removed with the rule model; `/trust` is the replacement. |
 | /config, /agents, /context | `tui/tui.go` | ✅ done | Group A (render-only); friendly permission labels. |
-| /mode, /permissions | `tui/tui.go` + `permission.Mode.Label` | ✅ done | Interactive numbered picker (or direct set) to change permission mode mid-session. |
+| /mode, /permissions | `tui/tui.go` + `permission.Mode.Label` | ✅ done | Interactive picker — arrows, type-to-filter, or digits (or direct set) — to change permission mode mid-session. |
 | /compact, /cost, /add-dir | `tui/tui.go` + `agent.Loop.Compact` | ✅ done | Group B. |
 | /plan, /doctor, /diff, /commit, /export | `tui/tui.go` + `doctor/` | ✅ done | Group C; /commit gated by a y/n confirm. |
 

@@ -61,15 +61,15 @@ func (w *Write) ValidateInput(raw json.RawMessage) error {
 func (w *Write) PermissionRequest(raw json.RawMessage) permission.PermissionRequest {
 	var in WriteInput
 	_ = json.Unmarshal(raw, &in)
-	return permission.PermissionRequest{Specifier: in.FilePath}
+	return pathRequest(in.FilePath)
 }
 
 // CheckPermissions: Write is a file-mutating (edit-class) tool.
-func (w *Write) CheckPermissions(pctx permission.Context, _ permission.PermissionRequest) permission.Decision {
-	return editClassDecision(pctx)
+func (w *Write) CheckPermissions(pctx permission.Context, req permission.PermissionRequest) permission.Decision {
+	return editPathDecision(pctx, req.Specifier)
 }
 
-func (w *Write) Execute(_ context.Context, tctx Context, raw json.RawMessage) ([]Result, error) {
+func (w *Write) Execute(ctx context.Context, tctx Context, raw json.RawMessage) ([]Result, error) {
 	var in WriteInput
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return nil, err
@@ -80,8 +80,12 @@ func (w *Write) Execute(_ context.Context, tctx Context, raw json.RawMessage) ([
 			return []Result{{Content: fmt.Sprintf("Error creating parent directory: %v", err), IsError: true}}, nil
 		}
 	}
-	if err := os.WriteFile(in.FilePath, []byte(in.Content), 0o644); err != nil {
+	if err := writeFileAtomic(in.FilePath, matchLineEndings(in.FilePath, []byte(in.Content)), 0o644); err != nil {
 		return []Result{{Content: fmt.Sprintf("Error writing file: %v", err), IsError: true}}, nil
 	}
-	return []Result{{Content: fmt.Sprintf("File written successfully to %s", in.FilePath)}}, nil
+	msg := fmt.Sprintf("File written successfully to %s", displayPath(tctx, in.FilePath))
+	// Surface any problems this write just introduced (no-op when LSP is off or
+	// the language has no server; never errors the write).
+	msg += appendDiagnostics(ctx, tctx, in.FilePath)
+	return []Result{{Content: msg}}, nil
 }

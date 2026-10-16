@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/greenthread-ai/klaudia/internal/native/search"
 	"github.com/greenthread-ai/klaudia/internal/permission"
 	"github.com/greenthread-ai/klaudia/internal/schema"
+	"github.com/greenthread-ai/klaudia/internal/trust"
 )
 
 // GrepInput is the Grep tool's input. Mirrors the JS Grep tool's core options.
@@ -17,10 +20,29 @@ type GrepInput struct {
 	Pattern    string `json:"pattern" jsonschema:"description=The regular expression pattern to search for in file contents"`
 	Path       string `json:"path,omitempty" jsonschema:"description=File or directory to search in (defaults to cwd)"`
 	Glob       string `json:"glob,omitempty" jsonschema:"description=Glob pattern to filter files (e.g. *.go)"`
-	OutputMode string `json:"output_mode,omitempty" jsonschema:"description=files_with_matches (default), content, or count"`
+	OutputMode string `json:"output_mode,omitempty" jsonschema:"description=content (the default: matching lines with line numbers), files_with_matches (paths only), or count (per-file counts). -A/-B/-C also select content"`
 	IgnoreCase bool   `json:"-i,omitempty" jsonschema:"description=Case-insensitive search"`
-	LineNum    bool   `json:"-n,omitempty" jsonschema:"description=Show line numbers (content mode)"`
-	Multiline  bool   `json:"multiline,omitempty" jsonschema:"description=Allow patterns to span lines (dot matches newline)"`
+	LineNum    bool   `json:"-n,omitempty" jsonschema:"description=Show line numbers (content mode; on by default)"`
+	Multiline  bool   `json:"multiline,omitempty" jsonschema:"description=Allow patterns to span lines (dot matches newline); content mode then shows each match with the line it starts on"`
+	Type       string `json:"type,omitempty" jsonschema:"description=Only search files of this type: go, py, js, ts, rust, java, c, cpp, rb, php, sh, md, json, yaml, toml, html, css, sql, swift, kotlin"`
+	After      int    `json:"-A,omitempty" jsonschema:"description=Lines of context after each match (content mode)"`
+	Before     int    `json:"-B,omitempty" jsonschema:"description=Lines of context before each match (content mode)"`
+	Context    int    `json:"-C,omitempty" jsonschema:"description=Lines of context before and after each match (content mode)"`
+	HeadLimit  int    `json:"head_limit,omitempty" jsonschema:"description=Return at most this many lines/files/counts; the rest are counted, not shown. Defaults to 200 in content mode when omitted"`
+	Hidden     bool   `json:"hidden,omitempty" jsonschema:"description=Also search hidden (dot) files and directories such as .github"`
+	NoIgnore   bool   `json:"no_ignore,omitempty" jsonschema:"description=Also search paths excluded by .gitignore/.ignore and the default skip list (node_modules, vendor, __pycache__)"`
+}
+
+// grepTypes maps the type filter's names to file extensions — the common
+// ripgrep types, enough that the model need not spell out a glob.
+var grepTypes = map[string][]string{
+	"go": {".go"}, "py": {".py", ".pyi"}, "js": {".js", ".mjs", ".cjs", ".jsx"},
+	"ts": {".ts", ".tsx", ".mts", ".cts"}, "rust": {".rs"}, "java": {".java"},
+	"c": {".c", ".h"}, "cpp": {".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".h"},
+	"rb": {".rb"}, "php": {".php"}, "sh": {".sh", ".bash", ".zsh"},
+	"md": {".md", ".markdown"}, "json": {".json"}, "yaml": {".yaml", ".yml"},
+	"toml": {".toml"}, "html": {".html", ".htm"}, "css": {".css", ".scss", ".sass"},
+	"sql": {".sql"}, "swift": {".swift"}, "kotlin": {".kt", ".kts"},
 }
 
 // Grep searches file contents using regular expressions.
@@ -39,26 +61,73 @@ func NewGrep() (*Grep, error) {
 
 func (g *Grep) Name() string { return "Grep" }
 
+// ConcurrencySafe: the search is pure Go over the filesystem (internal/native),
+// not a subprocess, so nothing is shared between two running searches.
+func (g *Grep) ConcurrencySafe() bool { return true }
+
 func (g *Grep) Description(context.Context) (string, error) {
-	return "Search file contents with a regular expression. output_mode controls results: " +
-		"\"files_with_matches\" (default) lists matching files, \"content\" shows matching lines, " +
-		"\"count\" shows per-file match counts. Filter files with glob, ignore case with -i.", nil
+	return "Search file contents with a regular expression.\n" +
+		"What is searched: by default, hidden (dot) files and directories such as .github, " +
+		"and paths excluded by .gitignore/.ignore (plus node_modules, vendor, __pycache__), are NOT searched. " +
+		"Search them with hidden: true / no_ignore: true, or by naming them in path or glob " +
+		"(path: \".github\", glob: \".github/**/*.yml\"). Credential locations (~/.ssh, ~/.aws, ~/.netrc, …) " +
+		"are never searched from above, even when named in glob; pass one as path to search it (that asks first). " +
+		"\"No matches found\" names what was skipped, so it means \"not found where I looked\", not \"not in the repo\"; " +
+		"with matches, a note names only skipped directories holding files the glob or type would have searched.\n" +
+		"Output: output_mode is \"content\" by default (matching lines with line numbers, capped at 200 " +
+		"with the remainder counted). Pass \"files_with_matches\" for paths only, or \"count\" for per-file counts. " +
+		"Giving -A/-B/-C (context lines) without output_mode also selects content. " +
+		"Context lines use '-' where matches use ':'.\n" +
+		"Filter files with glob or type (e.g. type=go); ignore case with -i. head_limit caps how many results " +
+		"are shown (200 when omitted in content mode); the rest are counted. A relative path is taken from the working directory.", nil
 }
 
 func (g *Grep) InputSchema() json.RawMessage { return g.schema.Raw }
 
-func (g *Grep) ValidateInput(raw json.RawMessage) error { return g.schema.Validate(raw) }
+func (g *Grep) ValidateInput(raw json.RawMessage) error {
+	if err := g.schema.Validate(raw); err != nil {
+		return err
+	}
+	var in GrepInput
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return err
+	}
+	if in.Type != "" {
+		if _, ok := grepTypes[strings.ToLower(in.Type)]; !ok {
+			names := make([]string, 0, len(grepTypes))
+			for n := range grepTypes {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			return fmt.Errorf("unknown type %q; known types: %s (or use glob)", in.Type, strings.Join(names, ", "))
+		}
+	}
+	if in.After < 0 || in.Before < 0 || in.Context < 0 || in.HeadLimit < 0 {
+		return fmt.Errorf("-A, -B, -C and head_limit must not be negative")
+	}
+	return nil
+}
 
-// PermissionRequest: Grep is read-only.
-func (g *Grep) PermissionRequest(json.RawMessage) permission.PermissionRequest {
-	return permission.PermissionRequest{}
+// PermissionRequest names the search root, so Read deny rules apply to it.
+func (g *Grep) PermissionRequest(raw json.RawMessage) permission.PermissionRequest {
+	var in GrepInput
+	_ = json.Unmarshal(raw, &in)
+	return pathRequest(firstNonEmptyPath(in.Path, "."))
 }
 
 func (g *Grep) CheckPermissions(pctx permission.Context, _ permission.PermissionRequest) permission.Decision {
 	return allowAlways(pctx)
 }
 
-func (g *Grep) Execute(_ context.Context, tctx Context, raw json.RawMessage) ([]Result, error) {
+// maxSearchResults bounds what Grep and Glob collect before formatting.
+const maxSearchResults = 20000
+
+// defaultContentHeadLimit caps a content-mode search that names no head_limit,
+// so a pattern-only call returns lines rather than an unbounded dump, and says
+// how many it left out.
+const defaultContentHeadLimit = 200
+
+func (g *Grep) Execute(ctx context.Context, tctx Context, raw json.RawMessage) ([]Result, error) {
 	var in GrepInput
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return nil, err
@@ -66,30 +135,94 @@ func (g *Grep) Execute(_ context.Context, tctx Context, raw json.RawMessage) ([]
 	root := in.Path
 	if root == "" {
 		root = tctx.WorkingDir
+	} else {
+		root = resolvePath(tctx, root)
+	}
+	before, after := in.Before, in.After
+	if in.Context > 0 {
+		before, after = max(before, in.Context), max(after, in.Context)
+	}
+	// Content is the default: a caller that names only a pattern wants the
+	// lines, with numbers, capped. Context flags select content too, so -A
+	// with no mode never returns bare paths and drops the context.
+	// files_with_matches and count stay explicit and uncapped.
+	mode := in.OutputMode
+	lineNum := in.LineNum
+	if mode == "" {
+		mode = "content"
+		lineNum = true
+	}
+	if mode != "content" {
+		before, after = 0, 0 // context only means something where lines are shown
+	} else if before > 0 || after > 0 {
+		lineNum = true // context lines are unreadable without numbers
+	}
+	limit := in.HeadLimit
+	if mode == "content" && limit == 0 {
+		limit = defaultContentHeadLimit
 	}
 
+	hidden := 0
+	var skipped search.SkipReport
 	matches, err := search.Grep(search.GrepOptions{
 		Pattern:    in.Pattern,
 		Root:       root,
 		IgnoreCase: in.IgnoreCase,
 		Multiline:  in.Multiline,
 		Glob:       in.Glob,
+		Limit:      maxSearchResults,
+		Ctx:        ctx,
+		Skip:       tctx.Hidden,
+		Skipped:    &hidden,
+		Hidden:     in.Hidden,
+		NoIgnore:   in.NoIgnore,
+		Private:    credentialGuard(root),
+		Report:     &skipped,
+		Exts:       grepTypes[strings.ToLower(in.Type)],
+		Before:     before,
+		After:      after,
 	})
 	if err != nil {
 		return []Result{{Content: fmt.Sprintf("Error: %v", err), IsError: true}}, nil
 	}
+	note := hiddenNote(hidden)
+	scope := skipScope{root: root, pattern: in.Glob, exts: grepTypes[strings.ToLower(in.Type)]}
 	if len(matches) == 0 {
-		return []Result{{Content: "No matches found"}}, nil
+		return []Result{{Content: "No matches found" + note + skipNote(&skipped, true, scope)}}, nil
+	}
+	note += skipNote(&skipped, false, scope)
+	for i := range matches {
+		matches[i].File = displayPath(tctx, matches[i].File) // relative to the working dir
 	}
 
-	switch in.OutputMode {
-	case "content":
-		return []Result{{Content: formatContent(matches, in.LineNum)}}, nil
-	case "count":
-		return []Result{{Content: formatCount(matches)}}, nil
-	default: // files_with_matches
-		return []Result{{Content: formatFiles(matches)}}, nil
+	if len(matches) > maxSearchResults {
+		matches = matches[:maxSearchResults]
+		note += fmt.Sprintf("\n(stopped after %d matches — narrow the pattern, path or glob to see the rest)", maxSearchResults)
 	}
+	var out string
+	switch mode {
+	case "content":
+		out = formatContent(matches, lineNum, before > 0 || after > 0)
+	case "count":
+		out = formatCount(matches)
+	default: // files_with_matches
+		out = formatFiles(matches)
+	}
+	return []Result{CapResult(Result{Content: headLimit(out, limit) + note})}, nil
+}
+
+// headLimit keeps the first n lines of out and says how many were left out,
+// so a capped result can't be mistaken for a complete one.
+func headLimit(out string, n int) string {
+	if n <= 0 {
+		return out
+	}
+	lines := strings.Split(out, "\n")
+	if len(lines) <= n {
+		return out
+	}
+	return strings.Join(lines[:n], "\n") +
+		fmt.Sprintf("\n[showing %d of %d lines; raise head_limit or narrow the search for the rest]", n, len(lines))
 }
 
 // formatFiles returns the distinct matching files, in stable order.
@@ -105,14 +238,25 @@ func formatFiles(matches []search.GrepMatch) string {
 	return strings.Join(files, "\n")
 }
 
-// formatContent returns "file:line:text" (or "file:text" without line numbers).
-func formatContent(matches []search.GrepMatch, lineNum bool) string {
+// formatContent returns "file:line:text" (or "file:text" without line
+// numbers). Context lines use '-' in place of ':', as grep and ripgrep do, and
+// with context on, a "--" line separates groups that are not adjacent.
+func formatContent(matches []search.GrepMatch, lineNum, withContext bool) string {
 	var b strings.Builder
+	prevFile, prevLine := "", 0
 	for _, m := range matches {
+		if withContext && prevFile != "" && (m.File != prevFile || m.Line != prevLine+1) {
+			b.WriteString("--\n")
+		}
+		prevFile, prevLine = m.File, m.Line
+		sep := ":"
+		if m.Context {
+			sep = "-"
+		}
 		if lineNum && m.Line > 0 {
-			fmt.Fprintf(&b, "%s:%d:%s\n", m.File, m.Line, m.Text)
+			fmt.Fprintf(&b, "%s%s%d%s%s\n", m.File, sep, m.Line, sep, m.Text)
 		} else {
-			fmt.Fprintf(&b, "%s:%s\n", m.File, m.Text)
+			fmt.Fprintf(&b, "%s%s%s\n", m.File, sep, m.Text)
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
@@ -134,4 +278,101 @@ func formatCount(matches []search.GrepMatch) string {
 		fmt.Fprintf(&b, "%s:%d\n", f, counts[f])
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// hiddenNote says how many paths a search left out under Read deny rules, so
+// the model knows the result is not the whole tree.
+func hiddenNote(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("\n(%d path(s) not searched: covered by a Read deny rule)", n)
+}
+
+// skipScope is what a search was filtered by: enough to tell whether a skipped
+// directory could have held a result.
+type skipScope struct {
+	root    string // the walk root, absolute
+	pattern string // Glob's pattern or Grep's glob; "" for none
+	exts    []string
+}
+
+// holdsBudget bounds the entries skipNote looks at in one skipped directory.
+const holdsBudget = 2000
+
+// skipNote says where a walk did not look, and how to look there.
+//
+// When nothing was found, everything counts: the skipped directories, the
+// dotfiles and ignored files, and the credential locations. When something
+// was found, a note on every search from a repository root (.github, .vscode,
+// node_modules exist nearly everywhere) would be noise read as a warning, so
+// it names only a skipped directory that really holds a file the search's
+// glob or type would have visited — checked by name, never by reading. A Grep
+// with neither has no such test, so it says nothing once it has matches.
+func skipNote(r *search.SkipReport, empty bool, scope skipScope) string {
+	if r.Empty() {
+		return ""
+	}
+	keep := func(dirs []string) []string { return dirs }
+	if !empty {
+		if scope.pattern == "" && len(scope.exts) == 0 {
+			return ""
+		}
+		keep = func(dirs []string) []string {
+			var out []string
+			for _, d := range dirs {
+				if search.Holds(scope.root, d, scope.pattern, scope.exts, holdsBudget) {
+					out = append(out, d)
+				}
+			}
+			return out
+		}
+	}
+	list := func(dirs []string, files int, noun string) string {
+		var parts []string
+		for _, d := range dirs {
+			parts = append(parts, d+"/")
+		}
+		if empty && files > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", files, noun))
+		}
+		return strings.Join(parts, ", ")
+	}
+	var what, how []string
+	if h := list(keep(r.HiddenDirs), r.HiddenFiles, "hidden file(s)"); h != "" {
+		what = append(what, "hidden: "+h)
+		how = append(how, "hidden: true")
+	}
+	if g := list(keep(r.IgnoredDirs), r.IgnoredFiles, "ignored file(s)"); g != "" {
+		what = append(what, "ignored: "+g)
+		how = append(how, "no_ignore: true")
+	}
+	if empty && r.MoreDirs > 0 {
+		what = append(what, fmt.Sprintf("%d more", r.MoreDirs))
+	}
+	var out string
+	if len(how) > 0 {
+		out = fmt.Sprintf("\n(not searched — %s. To include them pass %s, or name them in path or glob.)",
+			strings.Join(what, "; "), strings.Join(how, " / "))
+	}
+	if empty && len(r.Credentials) > 0 {
+		out += fmt.Sprintf("\n(credential locations are never searched from above: %s. To search one, pass it as path; that asks first.)",
+			strings.Join(r.Credentials, ", "))
+	}
+	return out
+}
+
+// credentialGuard keeps a walk from root out of the credential locations
+// (trust.CredentialGuard): the permission check sees only the root, so a
+// search from $HOME with hidden: true would otherwise read ~/.aws/credentials
+// without asking.
+func credentialGuard(root string) func(abs string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	if abs, err := filepath.Abs(root); err == nil {
+		root = abs
+	}
+	return trust.CredentialGuard(home, root)
 }

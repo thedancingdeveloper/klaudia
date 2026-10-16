@@ -144,6 +144,19 @@ type Effect struct {
 	// dozen. An uncertain mutating effect must never be auto-approved, and an
 	// uncertain read is not worth a prompt.
 	Certain bool
+	// Spelled marks an uncertain effect on another host whose path the command
+	// spells out in full: an absolute literal, no variable, no ~, no relative
+	// part. This machine cannot check that path (it is that host's file, and
+	// the remote working directory is unknown), so the effect stays uncertain
+	// and is still put to the user. But it names exactly the path a scope the
+	// user approved names, so a live grant may cover it (#305): without that,
+	// `ssh host rm -f /var/x/file` was refused again straight after the user
+	// approved deleting /var/x/file.
+	Spelled bool
+	// Recursive marks a delete that removes a tree (`rm -r`). A scope path
+	// the user named may be deleted, but never recursively: approving work on
+	// /etc/nginx must not authorise `rm -rf /etc/nginx`.
+	Recursive bool
 }
 
 // Assessment is everything a tool call was found to do.
@@ -208,12 +221,25 @@ func (a Assessment) Summary() string {
 	return strings.Join(parts, ", ")
 }
 
+// UnknownPath reports whether the effect lands on a path the command line does
+// not spell out — `rm -rf "$BUILD_DIR"`, `cat > "$OUT"`. Writing the literal
+// path instead is usually all it takes to let the classifier see it.
+func (e Effect) UnknownPath() bool {
+	return e.Res.Class == "path" && e.Res.ID == "" && !e.Certain
+}
+
 // Describe renders one effect as a phrase a person can read.
 func (e Effect) Describe() string {
 	if e.Kind == KindOpaque || e.Res.ID == "" {
 		if !e.Certain {
-			switch e.Res.Class {
-			case "path":
+			switch {
+			case e.UnknownPath():
+				switch e.Kind {
+				case KindDelete:
+					return "deletes a path it does not determine statically"
+				case KindDestructiveBulk:
+					return "recursively deletes a path it does not determine statically"
+				}
 				return "writes a path it does not determine statically"
 			default:
 				return "does something this reader could not determine"

@@ -1,31 +1,51 @@
 // Package skill loads reusable prompt/command skills from Markdown files with
-// YAML frontmatter. Skills are read from ~/.claude/skills, ~/.klaudia/skills,
-// <cwd>/.claude/skills and <cwd>/.klaudia/skills, in that order of increasing
-// precedence — the same user-then-project overlay as config.Load and
-// mcp.LoadConfig, extended to the directories the wider ecosystem installs
-// into.
+// YAML frontmatter. The skills bundled into the binary come first, then
+// ~/.claude/skills, ~/.klaudia/skills (under config.Root, so KLAUDIA_CONFIG_DIR
+// moves it), <root>/.claude/skills and <root>/.klaudia/skills (root being the
+// project root, the git top-level), then the same two under cwd when it is a
+// subdirectory, in that order of increasing precedence — the same
+// user-then-project overlay as config.Load and mcp.LoadConfig, extended to the
+// directories the wider ecosystem installs into.
 //
 // A skill file looks like:
 //
 //	---
 //	name: review
 //	description: Structured review of the current diff
-//	type: prompt        # prompt | command
-//	tools: [Bash, Read] # optional allowlist (growth point; unused in v1)
+//	type: prompt              # prompt | command
+//	allowed-tools: [Bash, Read] # optional tool allowlist (stored/surfaced; not yet enforced)
+//	argument-hint: <path>     # optional hint shown in completion/help
+//	model: sonnet             # optional per-skill model hint (stored/documented)
 //	---
 //	Review the staged changes carefully. $ARGUMENTS
 //
-// The body supports $ARGUMENTS substitution when the skill is invoked.
+// The body supports argument substitution when the skill is invoked:
+//
+//	$ARGUMENTS         all invocation arguments, verbatim
+//	$1, $2, … $N       the Nth whitespace-separated argument ("" when absent)
+//	$KLAUDIA_SKILL_DIR the skill's base directory, for referencing bundled files
+//	                   (also written ${KLAUDIA_SKILL_DIR})
+//
+// Frontmatter parity note: `allowed-tools`, `argument-hint` and `model` mirror
+// Claude Code's skill/command frontmatter. `allowed-tools` is the preferred
+// spelling; the older `tools` key is still accepted as an alias. Substitution
+// and the base-directory preamble follow Claude Code semantics.
 package skill
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/greenthread-ai/klaudia/internal/config"
 )
 
 // Skill types.
@@ -39,37 +59,120 @@ type Skill struct {
 	Name        string   // invocation name (also the /<name> slash command)
 	Description string   // one-line, model-facing
 	Type        string   // TypePrompt (default) | TypeCommand
-	Tools       []string // optional tool allowlist (growth point; unused in v1)
-	Body        string   // template body; supports $ARGUMENTS
-	Path        string   // source file, for diagnostics
+	Tools       []string // tool allowlist from allowed-tools (alias: tools); stored/surfaced, not yet enforced
+	ArgHint     string   // argument-hint: shown in completion/help; surfaced in the Skill tool description
+	Model       string   // model: per-skill model hint; stored/documented, no invocation-time switch yet
+	Body        string   // template body; supports $ARGUMENTS, $1..$N and $KLAUDIA_SKILL_DIR
+	Path        string   // source file, for diagnostics ("bundled:<file>" for a bundled skill)
+	Dir         string   // base directory holding the skill and its bundled files
+	Bundled     bool     // compiled into the binary rather than read from disk
 }
 
 // frontmatter is the YAML header schema.
 type frontmatter struct {
-	Name        string   `yaml:"name"`
-	Description string   `yaml:"description"`
-	Type        string   `yaml:"type"`
-	Tools       []string `yaml:"tools"`
+	Name         string   `yaml:"name"`
+	Description  string   `yaml:"description"`
+	Type         string   `yaml:"type"`
+	Tools        []string `yaml:"tools"`         // legacy alias for allowed-tools
+	AllowedTools []string `yaml:"allowed-tools"` // Claude Code spelling; wins over tools
+	ArgHint      string   `yaml:"argument-hint"`
+	Model        string   `yaml:"model"`
 }
 
-// Render substitutes $ARGUMENTS in the body with args (the text after the skill
-// name). When the body contains no $ARGUMENTS placeholder and args is non-empty,
-// the args are appended on a new line so they are never silently dropped.
+// positionalRe matches a positional argument placeholder: $1, $2, … $12. The
+// digit run is captured so multi-digit indices ($10) are not mistaken for $1
+// followed by a literal 0.
+var positionalRe = regexp.MustCompile(`\$(\d+)`)
+
+// Render expands the skill body for one invocation and returns the text handed
+// to the model (as a Skill tool result) or submitted as the /<name> prompt.
+//
+// Substitutions, in order:
+//   - $KLAUDIA_SKILL_DIR / ${KLAUDIA_SKILL_DIR} / ${CLAUDE_SKILL_DIR} → the
+//     skill's base directory (the last form for Claude Code compatibility)
+//   - $ARGUMENTS → the full args string, verbatim
+//   - $1, $2, … $N → the Nth whitespace-separated argument, "" when absent
+//
+// When the body references none of $ARGUMENTS or $1..$N and args is non-empty,
+// the args are appended on a new line so they are never silently dropped — the
+// original backward-compatible behaviour. Finally, when the skill has a known
+// base directory, a short preamble names it so the model can locate bundled
+// files even if the body never mentions $KLAUDIA_SKILL_DIR.
 func (s Skill) Render(args string) string {
-	if strings.Contains(s.Body, "$ARGUMENTS") {
-		return strings.ReplaceAll(s.Body, "$ARGUMENTS", args)
+	body := s.Body
+	// Prefer the loaded base directory; fall back to the source file's
+	// directory so a skill value that carries only Path still expands.
+	dir := s.Dir
+	if dir == "" && s.Path != "" {
+		dir = filepath.Dir(s.Path)
 	}
-	if strings.TrimSpace(args) == "" {
-		return s.Body
+	if dir != "" {
+		body = strings.NewReplacer(
+			"${CLAUDE_SKILL_DIR}", dir,
+			"${KLAUDIA_SKILL_DIR}", dir,
+			"$KLAUDIA_SKILL_DIR", dir,
+		).Replace(body)
 	}
-	return strings.TrimRight(s.Body, "\n") + "\n\n" + args
+
+	usesArgs := false
+	if strings.Contains(body, "$ARGUMENTS") {
+		usesArgs = true
+		body = strings.ReplaceAll(body, "$ARGUMENTS", args)
+	}
+	if positionalRe.MatchString(body) {
+		usesArgs = true
+		fields := strings.Fields(args)
+		body = positionalRe.ReplaceAllStringFunc(body, func(m string) string {
+			n, err := strconv.Atoi(m[1:])
+			if err != nil || n < 1 || n > len(fields) {
+				return ""
+			}
+			return fields[n-1]
+		})
+	}
+	if !usesArgs && strings.TrimSpace(args) != "" {
+		body = strings.TrimRight(body, "\n") + "\n\n" + args
+	}
+
+	return s.withBaseDir(body)
 }
 
-// Load reads skills from ~/.klaudia/skills then overlays <cwd>/.klaudia/skills
-// (project skills win on name collision). Malformed files are skipped, reporting
-// the reason to warn (warn may be nil). The result is sorted by name.
-func Load(cwd string, warn func(string)) []Skill {
+// withBaseDir prepends a one-line note naming the skill's base directory, so a
+// skill can reference bundled files (templates, scripts) that live beside it.
+// Skills with no known directory (e.g. a bare Skill value in a test) are
+// returned unchanged.
+func (s Skill) withBaseDir(body string) string {
+	if s.Dir == "" {
+		return body
+	}
+	return "Skill base directory: " + s.Dir +
+		"\n(Bundled files live here; $KLAUDIA_SKILL_DIR expands to this path.)\n\n" + body
+}
+
+// Load starts from the bundled skills, overlays the user directories, then the
+// project ones (a later layer wins on name collision). Malformed files are
+// skipped, reporting the reason to warn (warn may be nil). The result is sorted
+// by name.
+func Load(cwd string, warn func(string)) []Skill { return LoadProject(cwd, cwd, warn) }
+
+// LoadProject is Load for a launch directory inside a project: the project
+// root's .claude/skills and .klaudia/skills are read, then — when cwd is not
+// the root — cwd's own, which win on a name collision the way the closer
+// CLAUDE.md does. Reading cwd's directories also keeps skills that were put
+// beside a subdirectory launch (when skills were keyed by cwd) working.
+func LoadProject(root, cwd string, warn func(string)) []Skill {
+	return load(root, cwd, true, warn)
+}
+
+// LoadUser is Load without the project's skill directories. Used by
+// --safe-mode.
+func LoadUser(warn func(string)) []Skill { return load("", "", false, warn) }
+
+func load(root, cwd string, project bool, warn func(string)) []Skill {
 	byName := map[string]Skill{}
+	for _, sk := range Bundled() {
+		byName[sk.Name] = sk
+	}
 
 	// Searched in increasing precedence. ~/.claude and .claude are read for
 	// the same reason prompt.go reads ~/.claude/CLAUDE.md: that is where the
@@ -78,15 +181,19 @@ func Load(cwd string, warn func(string)) []Skill {
 	// each level, so a project can override an installed skill by name.
 	dirs := make([]string, 0, 4)
 	if home, err := os.UserHomeDir(); err == nil {
-		dirs = append(dirs,
-			filepath.Join(home, ".claude", "skills"),
-			filepath.Join(home, ".klaudia", "skills"),
-		)
+		dirs = append(dirs, filepath.Join(home, ".claude", "skills"))
 	}
-	dirs = append(dirs,
-		filepath.Join(cwd, ".claude", "skills"),
-		filepath.Join(cwd, ".klaudia", "skills"),
-	)
+	if cfgRoot := config.Root(); cfgRoot != "" {
+		dirs = append(dirs, filepath.Join(cfgRoot, "skills"))
+	}
+	if project {
+		for _, d := range projectDirs(root, cwd) {
+			dirs = append(dirs,
+				filepath.Join(d, ".claude", "skills"),
+				filepath.Join(d, ".klaudia", "skills"),
+			)
+		}
+	}
 
 	for _, dir := range dirs {
 		for _, sk := range loadDir(dir, warn) {
@@ -102,6 +209,18 @@ func Load(cwd string, warn func(string)) []Skill {
 	return out
 }
 
+// projectDirs returns root then cwd, leaving cwd out when it is the root, so
+// a caller reading project-scoped files from both does not read one twice.
+func projectDirs(root, cwd string) []string {
+	if root == "" {
+		root = cwd
+	}
+	if cwd == "" || filepath.Clean(cwd) == filepath.Clean(root) {
+		return []string{root}
+	}
+	return []string{root, cwd}
+}
+
 // loadDir parses every *.md file in dir. A missing dir yields nothing.
 // loadDir reads both supported layouts:
 //
@@ -113,6 +232,9 @@ func Load(cwd string, warn func(string)) []Skill {
 // its failure mode used to be silent: subdirectories were skipped before
 // anything was parsed, so a correctly written skill in the wrong shape produced
 // no skill, no warning, and no Skill tool at all.
+//
+// The one directory skipped quietly is Claude Code's ~/.claude/skills/synced
+// (see isSyncedStore).
 func loadDir(dir string, warn func(string)) []Skill {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -125,9 +247,16 @@ func loadDir(dir string, warn func(string)) []Skill {
 			defaultName string
 		)
 		switch {
+		case e.IsDir() && strings.HasPrefix(e.Name(), "_"):
+			// A leading underscore marks a directory that is not a skill (an embedding host's
+			// reference material kept beside the skills); skip it without a warning.
+			continue
 		case e.IsDir():
 			path, defaultName = skillFileIn(filepath.Join(dir, e.Name())), e.Name()
 			if path == "" {
+				if isSyncedStore(dir, e.Name()) {
+					continue
+				}
 				warnf(warn, "skill %s: directory has no SKILL.md", filepath.Join(dir, e.Name()))
 				continue
 			}
@@ -153,6 +282,26 @@ func loadDir(dir string, warn func(string)) []Skill {
 	return out
 }
 
+// syncedDir is where Claude Code keeps the skills it syncs from claude.ai:
+// ~/.claude/skills/synced/<bucket>/<skill>/SKILL.md, beside a manifest.json.
+const syncedDir = "synced"
+
+// isSyncedStore reports whether dir/name is Claude Code's store of synced
+// skills, which is skipped without a warning. It is not a skill (so "no
+// SKILL.md" is true but useless, and printed at every start), and the skills in
+// it are not loaded either: many are claude.ai-specific — they drive that
+// product's artifacts, connectors and file tools — and would be offered to the
+// model here as if they worked. Only the user's ~/.claude/skills is checked,
+// because that is the only place Claude Code writes it; a "synced" directory
+// anywhere else is an ordinary misplaced skill and still warns.
+func isSyncedStore(dir, name string) bool {
+	if name != syncedDir {
+		return false
+	}
+	home, err := os.UserHomeDir()
+	return err == nil && filepath.Clean(dir) == filepath.Join(home, ".claude", "skills")
+}
+
 // skillFileIn returns the skill definition inside a skill directory, or "" if
 // there is none. Both spellings are accepted because a case-insensitive
 // filesystem hides the difference until the file reaches Linux.
@@ -174,13 +323,26 @@ func parse(data []byte, path string) (Skill, error) {
 // omits one — the file's basename for the flat layout, the directory's name for
 // the SKILL.md layout, where "SKILL" would be a useless name.
 func parseNamed(data []byte, path, defaultName string) (Skill, error) {
+	// A UTF-8 byte-order mark (editors on Windows add one) hid the opening
+	// "---", so the frontmatter was read as body and the skill lost its
+	// description without a word.
+	data = bytes.TrimPrefix(data, []byte("\ufeff"))
 	fm, body, err := splitFrontmatter(data)
 	if err != nil {
 		return Skill{}, err
 	}
 	var meta frontmatter
 	if err := yaml.Unmarshal(fm, &meta); err != nil {
-		return Skill{}, fmt.Errorf("invalid frontmatter: %w", err)
+		// Skill files are written as "key: text", and text is prose: a
+		// description like "Use this. Triggers include: deck" is not valid
+		// YAML (a second ": " starts a mapping), and strict parsing turned
+		// such skills away. Read the known keys line by line instead, and
+		// fail only when that finds nothing either.
+		lenient, ok := lenientFrontmatter(fm)
+		if !ok {
+			return Skill{}, fmt.Errorf("invalid frontmatter: %w", err)
+		}
+		meta = lenient
 	}
 
 	name := strings.TrimSpace(meta.Name)
@@ -197,14 +359,69 @@ func parseNamed(data []byte, path, defaultName string) (Skill, error) {
 		return Skill{}, fmt.Errorf("invalid type %q (want %q or %q)", typ, TypePrompt, TypeCommand)
 	}
 
+	// allowed-tools is the Claude Code spelling and wins; tools is the legacy
+	// alias kept so existing skills keep working.
+	toolset := meta.AllowedTools
+	if len(toolset) == 0 {
+		toolset = meta.Tools
+	}
+
 	return Skill{
 		Name:        name,
 		Description: strings.TrimSpace(meta.Description),
 		Type:        typ,
-		Tools:       meta.Tools,
+		Tools:       toolset,
+		ArgHint:     strings.TrimSpace(meta.ArgHint),
+		Model:       strings.TrimSpace(meta.Model),
 		Body:        strings.TrimSpace(string(body)),
 		Path:        path,
+		Dir:         filepath.Dir(path),
 	}, nil
+}
+
+// lenientFrontmatter reads "key: rest of line" for the frontmatter keys,
+// joining indented continuation lines to the value before them and stripping
+// matching quotes. tools takes "[a, b]" or "a, b". ok is false when no known
+// key was found.
+func lenientFrontmatter(fm []byte) (frontmatter, bool) {
+	var meta frontmatter
+	vals := map[string]string{}
+	var last string
+	for _, line := range strings.Split(string(fm), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if last != "" && (strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")) && strings.TrimSpace(line) != "" {
+			vals[last] += " " + strings.TrimSpace(line)
+			continue
+		}
+		key, val, found := strings.Cut(line, ":")
+		key = strings.TrimSpace(key)
+		if !found || !slices.Contains([]string{"name", "description", "type", "tools"}, key) {
+			last = ""
+			continue
+		}
+		vals[key] = strings.TrimSpace(val)
+		last = key
+	}
+	if len(vals) == 0 {
+		return meta, false
+	}
+	unquote := func(s string) string {
+		if len(s) >= 2 && (s[0] == '"' || s[0] == '\'') && s[len(s)-1] == s[0] {
+			return s[1 : len(s)-1]
+		}
+		return s
+	}
+	meta.Name = unquote(vals["name"])
+	meta.Description = unquote(vals["description"])
+	meta.Type = unquote(vals["type"])
+	if t := strings.Trim(vals["tools"], "[] "); t != "" {
+		for _, tool := range strings.Split(t, ",") {
+			if tool = unquote(strings.TrimSpace(tool)); tool != "" {
+				meta.Tools = append(meta.Tools, tool)
+			}
+		}
+	}
+	return meta, true
 }
 
 // splitFrontmatter separates a leading `---\n … \n---` YAML block from the body.

@@ -19,6 +19,10 @@ extras we lean on day to day:
   recolors, persisted in config.
 - **[Standing goals](#goals--autonomous-iteration)** — `/goal` pins an objective
   that's re-stated to the model every turn.
+- **[Editor integration (ACP)](#editors-acp)** — `--input-format acp` makes
+  Klaudia the agent behind Zed, `acp.nvim` or the JetBrains plugin.
+- **[Isolated sub-agents](#your-changes-and-klaudias)** — children that write
+  get their own git checkout, so two of them can work at once.
 - Plus [OS/container Bash sandboxing](#sandboxing-the-bash-tool), local
   [web search & browsing](#web-search--browsing), [MCP](#mcp), and
   [skills](#skills).
@@ -26,6 +30,9 @@ extras we lean on day to day:
 ## Getting started
 
 ### Install
+
+Requires **Go 1.26 or newer** (`go.mod` says `go 1.26`; older toolchains stop
+with a version error or try to download a newer one). Check with `go version`.
 
 ```bash
 go install github.com/greenthread-ai/klaudia/cmd/klaudia@main
@@ -43,16 +50,37 @@ Prefer to build from a checkout? See [Build](#build).
 ### Create a config (optional but recommended)
 
 Klaudia reads `~/.klaudia/config.toml` automatically for every run; a project
-`./.klaudia/config.toml` overlays it when present. Generate a commented starter:
+`./.klaudia/config.toml` overlays it when present. `KLAUDIA_CONFIG_DIR` replaces
+`~/.klaudia` as the user directory — config, `.mcp.json`, skills, sessions, job
+logs and the browser profile all move with it. Generate a commented starter:
 
 ```bash
-klaudia --create-config=global   # ~/.klaudia/config.toml  (your default)
+klaudia --create-config=global   # ~/.klaudia/config.toml  (your default; honours KLAUDIA_CONFIG_DIR)
 # or:
 klaudia --create-config=local    # ./.klaudia/config.toml  (project override)
 ```
 
-Both commands refuse to overwrite an existing config (so you can't accidentally
-clobber settings); delete the file first if you want a fresh starter.
+The starter selects the Anthropic provider, so it works as written with
+`ANTHROPIC_API_KEY` set; the OpenAI-compatible settings are in it, commented
+out. Both commands refuse to overwrite an existing config (so you can't
+accidentally clobber settings); delete the file first if you want a fresh
+starter.
+
+A project config arrives with the checkout, so in a folder you haven't trusted
+Klaudia ignores its security-relevant keys and says which ones: `provider`,
+`baseURL`, `apiKey`, `apiKeyEnv`, `extraHeadersEnv`, `permissions.mode`,
+`permissions.allow`, `trust.mode`, the sandbox settings other than `readOnly`,
+and `browser.chromePath`/`remoteUrl`/`userDataDir`. Preferences (model, theme,
+limits) and deny rules always apply. Run `klaudia --trust-project` in the folder
+to apply the whole file; `--create-config=local` trusts the folder it writes to.
+The list is `~/.klaudia/trusted-projects`, one directory per line. A launcher
+that renders `./.klaudia/config.toml` itself (an embedder writing a per-session
+config) passes `--trusted-project-config` to apply it in full for that run.
+
+`klaudia --safe-mode` starts without anything the project supplies — its
+`.klaudia/config.toml`, `.mcp.json` servers, skills, `CLAUDE.md`, memory and
+knowledge — for opening an unfamiliar repository or getting past a broken
+project config. Your own config, global MCP servers and skills still load.
 
 ### Authentication
 
@@ -77,18 +105,29 @@ klaudia
 
 **OpenAI-compatible provider**
 
-Edit the config you just generated and set the provider block:
+In the config you just generated, replace `provider = "anthropic"` with the
+commented OpenAI-compatible block (delete the leading `#` from each line) and
+fill in your endpoint:
 
 ```toml
 # ~/.klaudia/config.toml  (comments are supported)
 provider = "openai"
-model = "openai/gpt-5.5"
+# The model id is sent to the endpoint exactly as written: use the id the
+# endpoint lists (GET <baseURL>/models, or /model in the TUI). Do not prefix it
+# with the provider name — "openai/gpt-5.5" is a different id from "gpt-5.5",
+# and only hosts whose own ids carry a prefix (OpenRouter) want one.
+model = "gpt-5.5"
 baseURL = "https://api.example.com/v1"
 
 # apiKeyEnv is the NAME of the environment variable that holds your key —
 # pick any name you like and export a variable of that name (see below).
 # Prefer this over apiKey = "sk-..." so the key stays out of the file.
 apiKeyEnv = "MY_API_KEY"
+
+# extraHeadersEnv adds HTTP headers to every request, each read from the NAMED env
+# var (never a value in the file). Use it for endpoints gated by non-bearer headers
+# — e.g. a Cloudflare Access service token — with or without apiKeyEnv:
+extraHeadersEnv = { "CF-Access-Client-Id" = "CF_ID", "CF-Access-Client-Secret" = "CF_SECRET" }
 ```
 
 Then export the variable you named in `apiKeyEnv` and run:
@@ -102,15 +141,31 @@ Once the TUI starts, type `/doctor` to verify auth and environment status.
 
 ## Build
 
-Pure Go, no CGO, no system libraries:
+Pure Go, no CGO, no system libraries. Needs Go 1.26+ (the `go` line in
+`go.mod`):
 
 ```bash
 CGO_ENABLED=0 go install ./cmd/klaudia   # or: go build -o klaudia ./cmd/klaudia
-go test ./internal/...
+make check   # static checks, unit (race), hermetic, and e2e — what CI runs
 ```
 
 The result is one self-contained binary (Linux + macOS).
 
+`klaudia --version` prints the reference-compatible `2.1.66-klaudia (Klaudia)`
+and then the build: the commit it was built from, `+dirty` if the tree had
+uncommitted changes, and the commit time. The startup banner, `/doctor` and each
+transcript line (`klaudiaBuild`) carry the same, so a stale installed binary is
+visible. `go build`/`go install` in a checkout record this automatically; a
+build without VCS information (a source tarball, `-buildvcs=false`) shows
+`dev`, and a release build can stamp it:
+
+```bash
+go build -ldflags "-X github.com/greenthread-ai/klaudia/internal/version.release=v1.2.3 \
+  -X github.com/greenthread-ai/klaudia/internal/version.commit=$(git rev-parse HEAD)" ./cmd/klaudia
+```
+
+Testing is layered; see [docs/testing.md](docs/testing.md). `go test ./e2e/...`
+drives the real binary against a scripted model — no credential, no network.
 Two end-to-end rigs go beyond the unit tests (both need a working credential):
 `scripts/smoke.sh` drives the real agent loop across modes, the client-side
 tools and the resume path on `haiku`; `scripts/torture.sh` runs the spec's
@@ -127,8 +182,26 @@ scores the transcript against the spec's checklist.
 ```
 
 A Bubble Tea terminal UI: streamed Markdown answers, `/` slash commands with
-type-ahead, fuzzy `@path` file completion (Tab, Tab again to cycle), input
-history (↑/↓), and `Esc` to interrupt a turn. Type `/help` for the full list.
+type-ahead and Tab completion of their arguments (`/theme`, `/mode`, `/model`
+from its last-fetched list, job names, `/last` numbers, pinned files, `/trust
+revoke` ids), fuzzy `@path` file completion (Tab, Tab again to cycle), input
+history (↑/↓, and `Ctrl+R` to search it), and `Esc` to interrupt a turn. Type
+`/help` for the full list.
+
+Input history is kept per project, the last 200 prompts, in
+`~/.klaudia/sessions/<project>/prompt-history.ndjson` — beside the transcripts
+and outside the repository, so it cannot be committed by accident. A `!`
+command is remembered as the line you typed, never its output; a prompt holding
+a paste chip, or over 8 KiB, stays in the session's history only. Resuming a
+session also puts its prompts back under ↑. In a multi-line prompt ↑ and ↓ move
+between lines and browse history from the first and last line. `Ctrl+R` searches
+backwards as you type: `Ctrl+R` again for an older match, `Enter` to put the
+match in the box to edit, `Esc` to cancel.
+
+A line that starts with `/` but is not a command is sent as a message when its
+first word is a path (`/etc/nginx/nginx.conf fails to parse`) or is followed by
+more text. A lone unknown `/word` is reported with the nearest commands. Start a
+line with `//` to always send it as a message, minus one slash.
 
 ### Return, and multi-line input
 
@@ -170,6 +243,46 @@ send on macOS, that now adds a line; and pressing `Esc` immediately followed by
 `Return` can be read as `Alt+Return`, since that is the same byte sequence —
 one of the reasons a terminal cannot simply invent a `Ctrl+Return` key.
 
+### Attention notifications
+
+When Klaudia needs you while you are looking elsewhere — a turn has finished, or
+a permission/approval prompt is waiting — it can get your attention through the
+terminal:
+
+```toml
+[tui]
+notify = "bell"           # default when unset: the terminal bell (\a)
+# notify = "bell,osc9"    # bell + an iTerm2/kitty/WezTerm desktop notification
+# notify = "osc777"       # an rxvt/urxvt desktop notification
+# notify = "all"          # every mechanism
+# notify = "off"          # stay silent
+```
+
+The mechanisms are `bell` (the terminal bell, the most widely supported),
+`osc9` (an OSC 9 desktop notification honoured by iTerm2, kitty and WezTerm) and
+`osc777` (an OSC 777 notification for rxvt/urxvt and others); combine them with
+commas. When your terminal reports focus (Klaudia enables focus reporting, which
+does not disturb scrollback or selection), the notification fires only while the
+window is unfocused; a terminal that does not report focus is notified either
+way.
+
+### A quiet prompt and a state title
+
+An idle prompt writes nothing to the terminal: the cursor is steady and no timer
+runs while Klaudia waits, so a multiplexer, a remote viewer or a program driving
+Klaudia in a pseudo-terminal sees output stop when the work does. Klaudia also
+sets the terminal title to its state — `klaudia: ready`, `klaudia: working`,
+`klaudia: awaiting approval`, `klaudia: goal-loop` — each time the state
+changes ([docs/embedding.md](docs/embedding.md#the-interactive-tui-in-a-terminal)).
+
+```toml
+[tui]
+cursor = "steady"   # default; "blink" repaints the input twice a second while idle
+title = "on"        # default; "off" leaves the terminal title alone
+```
+
+`KLAUDIA_CURSOR_BLINK=1` (or `0`) overrides `cursor` for one run.
+
 **Klaudia renders inline, not full-screen.** Finished output is printed into
 your terminal's real scrollback and only the input and status bar are redrawn in
 place, so scrolling, drag-to-select, your terminal's own search and tmux copy
@@ -196,9 +309,19 @@ interrupt and send it now, or `↑` to edit it.
 `/model` with no argument asks the provider which models it serves and offers
 them as a picker — Anthropic and OpenAI-compatible endpoints both answer at
 `GET /v1/models` — so you don't have to remember an exact model ID. `/model
-<alias|id>` still sets one directly (`opus`, `sonnet`, `haiku`, `fable`, or any
-full ID). Picking from the list also records that model's real context window,
+<alias|id>` still sets one directly (`opus`, `sonnet`, `haiku`, `fable` on
+Anthropic, or any full ID). Picking from the list also records that model's real context window,
 which is what the status bar's `ctx N%` measures against.
+
+`/effort <level>` sets the reasoning effort for the rest of the session
+(`low`, `medium`, `high`, `xhigh`, `max`; `default` returns to the model's own);
+with no argument it reports the current level. It applies from the next turn.
+
+Every picker (`/model`, `/mode`, `/theme`, `/mcp`) works the same way: `↑`/`↓`
+move the highlight and Enter picks it, typing filters the list (Backspace edits
+the filter), `1`–`9` pick directly while no filter is typed, and Esc cancels. A
+list longer than the terminal scrolls, so `/model` offers everything the
+endpoint serves.
 
 `/theme` switches the colour theme (Markdown + chrome) for the session; set a
 durable default with `theme = "nord"` in `.klaudia/config.toml` (dracula |
@@ -216,6 +339,10 @@ watcher and keep working. Jobs get a name, a port and a log file; see
 # Print the final result and exit
 ./klaudia -p "What files are in this directory?"
 
+# Piped stdin is the prompt, or is appended to one given as an argument
+echo "What files are in this directory?" | ./klaudia -p
+git diff | ./klaudia -p "Review this change"
+
 # Unattended, including changes to this machine
 ./klaudia -p "Install and configure nginx" --allow-host-changes
 
@@ -226,34 +353,205 @@ watcher and keep working. Jobs get a name, a port and a log file; see
 ./klaudia -p "…" --output-format stream-json --verbose --include-partial-messages
 ```
 
+A positional prompt is shorthand for `-p`: `./klaudia "What files are here?"`
+runs headless and exits, so it scripts the same way. To open the TUI with a first
+message instead — a persistent session that starts working straight away, which
+is what an orchestrator launching Klaudia wants — use
+`./klaudia --prompt-interactive "Fix the failing test"`. The text is sent as if
+typed, so slash commands (`--prompt-interactive "/goal run 5"`) and `@file`
+references work, and the session stays open afterwards. (Claude Code opens its TUI
+with the prompt instead; see [docs/ux-spec.md](docs/ux-spec.md).)
+`--max-turns N` caps the agentic loop; `0`, the default, is unlimited.
+
+With `--output-format json` or `stream-json`, stdout always ends with a
+`result` line, even when the run cannot start (no credential, an incomplete
+provider config, a bad flag combination): `is_error` is `true` and `result`
+carries the reason, which is also printed to stderr. `duration_api_ms` is the
+time spent waiting on the model, `duration_ms` the whole run. `total_cost_usd`
+is priced from Klaudia's model table and reads `0` for a model it has no price
+for (every OpenAI-compatible model) — unpriced, not free. The exit code says what kind of failure it
+was — see [Exit codes](docs/jobs.md#exit-codes).
+
+### Shell completion
+
+```bash
+./klaudia completion bash > ~/.local/share/bash-completion/completions/klaudia
+./klaudia completion zsh|fish|powershell --help   # install steps per shell
+```
+
 ### Embedding (stream-json over stdin)
 
 A persistent agent driven by newline-delimited JSON over stdin/stdout — the
-channel for editor/SDK integrations (no terminal needed):
+channel for SDK integrations, orchestrators, and an editor without ACP support
+(no terminal needed). The full, versioned contract — which lines and fields are
+stable, the session lifecycle, and `klaudia --capabilities` for feature
+detection — is [docs/embedding.md](docs/embedding.md); this is the overview:
 
 ```bash
 ./klaudia --input-format stream-json --verbose
 ```
+
+Each `{"type":"user","message":{"role":"user","content":"…"}}` line is one
+turn. Conversation content streams back as the same message envelope the `-p
+--output-format stream-json` path (and Claude Code) emit — one line per
+assistant message and per tool-result message, with `session_id` and `uuid`:
+
+```json
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"…"},
+ {"type":"tool_use","id":"…","name":"Read","input":{…}}]},"session_id":"…","uuid":"…"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"…",
+ "content":"…"}]},"session_id":"…","uuid":"…"}
+```
+
+`usage`, `tool_progress` and `compaction` events follow as flat lines, and the
+turn ends with a `result` line.
+
+**Permission asks are the client's to answer.** When the permission flow cannot
+settle a tool call on its own, Klaudia emits a control request and blocks the
+turn until the client replies:
+
+```json
+{"type":"control_request","request_id":"<id>",
+ "request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}
+```
+
+The reply carries the same `request_id`; `behavior` is `"allow"` or `"deny"`,
+and a deny may explain itself in `message`:
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"<id>",
+ "response":{"behavior":"deny","message":"read-only embedder"}}}
+```
+
+Only a call nothing else can settle reaches the client. In `autonomous` (the
+default) project work runs without asking, so what is asked about is a change
+to this machine — a package install, a write outside the project — and in
+`bypassPermissions` nothing is asked at all. There are no allow/deny rules:
+the per-command model was removed upstream (see [docs/trust.md](docs/trust.md)).
+
+An ask the client never answers is denied after `--ask-timeout` (default
+10 minutes; `0` waits forever), with a tool result that says so — a stalled or
+protocol-unaware client sees a finished turn, not a hung process.
+
+Permission asks, the model's questions (`AskUserQuestion`) and plan approvals
+(`ExitPlanMode`) all arrive as `control_request` lines and are answered on the
+matching `request_id`. A peer that has not implemented a subtype should answer
+with an error: that reads as "cancelled" and leaves the model where it was,
+rather than an answer the user never gave being attributed to them.
+
+**The client can steer the session with its own control requests**, in Claude
+Code's shapes. Each is answered with a `control_response` carrying the same
+`request_id` — `"subtype":"success"` with a `response` object, or
+`"subtype":"error"` with an `error` message:
+
+```json
+{"type":"control_request","request_id":"r1","request":{"subtype":"interrupt"}}
+{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{}}}
+```
+
+- `interrupt` cancels the running turn (what Esc does in the TUI), including a
+  `can_use_tool` ask it is waiting on, and any turn sent before the interrupt
+  that has not started. Each such turn still ends with a `result` line, with
+  `"subtype":"error_during_execution"` and a result saying it was interrupted.
+- `set_permission_mode` (`"mode":"plan"`, …) applies from the next tool call,
+  sub-agents included. The rules are the command line's: `autonomous` needs the
+  host gate enforcing, and `bypassPermissions` is refused unless the session was
+  launched in it.
+- `set_model` (`"model":"opus"`; omitted or `"default"` restores the launch
+  model) applies from the next turn.
+- `initialize` is answered once. One that asks for `hooks`, `sdkMcpServers`,
+  `agents`, `jsonSchema` or a system prompt is refused — Klaudia cannot run an
+  SDK's callbacks, and saying so beats a hook that silently never fires.
+
+The `result` line carries `session_id` and `duration_ms` alongside `usage`.
+
+### Editors (ACP)
+
+```bash
+./klaudia --input-format acp
+```
+
+Klaudia serves the [Agent Client Protocol](https://agentclientprotocol.com) v1
+over stdio, so Zed, Neovim's `acp.nvim` and the JetBrains plugin can drive it as
+their coding agent — the editor's own UI for messages, tool calls, diffs,
+checklists and permission prompts, Klaudia doing the work. In Zed
+(`~/.config/zed/settings.json`):
+
+```json
+{
+  "agent_servers": {
+    "Klaudia": {
+      "type": "custom",
+      "command": "klaudia",
+      "args": ["--input-format", "acp"]
+    }
+  }
+}
+```
+
+Sessions, modes and commands map onto what Klaudia already has: ACP session ids
+*are* transcript ids (so `--resume` and the editor's thread list agree), the
+mode picker is `/mode` and is per thread, `TodoWrite` becomes a native plan,
+`Edit` and `Write` carry diffs, and `.klaudia/skills` appear in the command
+palette. `fs/read_text_file` is used when the editor offers it, so the model
+reads your *unsaved buffer* rather than stale text on disk.
+
+Writing through the client, `terminal/*` and `session/delete` are declined on
+purpose — the reasoning, and the rest of the surface, is in
+[docs/acp.md](docs/acp.md).
 
 ### Resuming
 
 ```bash
 ./klaudia                            # auto-resume the most recent session here
 ./klaudia --new-session              # start fresh instead of auto-resuming
-./klaudia --continue                 # explicitly resume the most recent session here
+./klaudia --continue                 # explicitly resume the most recent session here (-c)
 ./klaudia -r <session-id>            # resume a specific session
 ./klaudia -r <session-id> --full     # replay the whole transcript (not the summary)
+./klaudia --session-id <id> …        # record under an id you choose (must be new)
+./klaudia -r <old> --session-id <new> # fork <old> into a new session <new>
 ```
 
-Auto-resume is an interactive convenience: headless (`-p`) and embedding
-(`--input-format stream-json`) runs stay stateless unless you pass
-`--continue` or `-r <id>`.
+Auto-resume is an interactive convenience: headless (`-p`) and the embedding
+protocols (`--input-format stream-json` and `acp`) stay stateless unless you
+pass `--continue` or `-r <id>`. An ACP client has `session/list` and
+`session/load` for the same job.
 
-Sessions are JSONL transcripts under `~/.klaudia/sessions/<encoded-cwd>/`
-(override the base with `KLAUDIA_CONFIG_DIR`). Klaudia still reads legacy
-transcripts from `~/.klaudia/projects/<encoded-cwd>/` during migration. When a
-session has a persisted compaction summary, resume seeds from it (token-saving)
-unless `--full`.
+Auto-resume always says what it did, in one line before the TUI starts:
+`Resumed <id> · 42 messages · last active 3h ago · --new-session to start
+fresh`. A session last active longer ago than the staleness cutoff is not
+auto-resumed; the launch starts fresh and names the old session and how to
+resume it (`--continue` or `-r <id>`, which ignore the cutoff). The cutoff
+defaults to 24 hours:
+
+```toml
+[session]
+autoResumeMaxAge = "24h"   # a Go duration or whole days ("7d"); "0" disables the cutoff
+```
+
+`/clear` starts a new session id. The cleared conversation stays on disk as its
+own session (`/clear` prints the `-r <id>` that reopens it) and is not what the
+next launch auto-resumes — not even when you clear and quit straight away.
+
+Sessions are JSONL transcripts under `~/.klaudia/sessions/<encoded-root>/`
+(override the base with `KLAUDIA_CONFIG_DIR`), where the root is the project
+root: the git top-level of the launch directory, or the launch directory itself
+outside a repository. Starting Klaudia in a subdirectory therefore resumes the
+repository's session. The launch directory's own dir (where sessions went
+before they were keyed by the root) is still read by auto-resume and
+`--continue`, and Klaudia still reads legacy transcripts from
+`~/.klaudia/projects/<encoded-dir>/` during migration. When a session has a
+persisted compaction summary, resume seeds from it plus the messages recorded
+since that compaction (token-saving) unless `--full`.
+
+`-r <id>` finds the transcript by id anywhere under the sessions root, not only
+in the current project's dir, and keeps appending to the file it was
+found in. An embedder can therefore pin the id with `--session-id`, stop the
+process, move the sessions root (for example to another host, pointed at with
+`KLAUDIA_CONFIG_DIR`) and resume from a different working directory. A session
+id is letters, digits, `-` and `_` (at most 128). In embedding mode the first
+output line is `{"type":"system","subtype":"init","session_id":…,"resumed":…,
+"history_messages":…}`, so the peer learns the id before it sends a turn.
 
 ## Long-running commands, logs, and your shell
 
@@ -292,6 +590,21 @@ touch your index, does not create a stash, and shows the exact `git cat-file`
 commands it would run before doing anything. Full detail:
 [docs/working-tree.md](docs/working-tree.md).
 
+**Sub-agents that can write get a checkout of their own.** Two children editing
+one tree is not a race in the usual sense — nothing errors, and every step
+succeeds: one writes a file, another reads a half-written version and reasons
+about it, a third rewrites the first one's edit. So a sub-agent holding `Write`,
+`Edit`, `NotebookEdit` or `Bash` runs in its own `git worktree` under
+`~/.klaudia/worktrees/`, seeded with your *uncommitted* work rather than `HEAD`,
+and its changes are applied back to your tree with `git apply` when it finishes
+— files only, never your index. `Explore` and `Plan` keep sharing the tree;
+they have nothing to isolate. Anything that could not be applied because the
+file moved underneath is named to you *and* to the model, and the checkout is
+kept so you still have that version. Ignored files are not copied, so a child
+that needs an install step before it can test will pay for it — turn the whole
+thing off with `[subagents] worktree = false` if that is the wrong trade for
+your project.
+
 `/context` shows what Klaudia has actually read rather than a token percentage,
 and `/pin <path>` keeps a file in context every turn so it survives compaction.
 
@@ -328,9 +641,10 @@ as `⊘ changes this machine: writes /dev/null — trying another way` rather th
 a failure. You are asked only when the work genuinely cannot proceed otherwise,
 and then **(s)omething else** sits beside yes and no — declining usually means
 "not like that" rather than "give up", so it keeps the turn alive and lets you
-redirect. Anything blocked and never approved is named in the completion block
-under `Not done — needs your agreement`, so giving up quietly is not an option
-available to it.
+redirect. Every other permission ask offers it too, and each prompt notes that
+Esc cancels the whole turn. Anything blocked and never approved is named in the
+completion block under `Not done — needs your agreement`, so giving up quietly
+is not an option available to it.
 
 **This is a guardrail against well-intentioned mistakes, not a security
 boundary.** It reads command lines and tool inputs; it does not watch what
@@ -341,6 +655,7 @@ set `[sandbox] mode = "os"`.
 | Flag | Mode | Behavior |
 |------|------|----------|
 | *(default)* | `autonomous` | Finish the task; ask before changing this machine |
+| `--permission-mode acceptEdits` | `acceptEdits` | Edit files in the workspace freely; ask before commands, network, MCP calls and edits outside it |
 | `--permission-mode plan` | `plan` | Read-only; mutations and network blocked |
 | `--dangerously-skip-permissions` | `bypassPermissions` | Allow everything, including host changes |
 
@@ -348,14 +663,23 @@ set `[sandbox] mode = "os"`.
 runs do project and remote work but refuse host changes unless you pass
 `--allow-host-changes`.
 
-The per-command model it replaced is **deprecated, not removed**: legacy modes
-(`default`, `acceptEdits`, `dontAsk`), `--allowedTools 'Bash(go test:*)'` and
-the `/allow` and `/deny` commands are still honoured so existing setups keep
-working, but they create nothing new and `/allow`/`/deny` are no longer listed
-in `/help`. `/trust` grants by what an operation *does* rather than by matching
-command text, and shows any surviving rules alongside its own. A config that
-already has permission rules starts in observe mode until you run
-`/trust upgrade`.
+The per-command model it replaced is **removed**. There are no allow/deny
+rules, no `--allowedTools`/`--disallowedTools`, no `/allow` or `/deny`, no
+`default`/`acceptEdits`/`dontAsk` modes, and no "always" answer on a prompt;
+`[permissions] allow`/`deny` and `[trust]` in `.klaudia/config.toml` are no
+longer read. `/trust` grants by what an operation *does* rather than by
+matching command text, and an approval is session-scoped.
+
+Running both models at once was the problem: a rule in a project config
+demoted the next session to a mode that asked before every edit, so "always"
+— the answer offered to stop a prompt — was what produced more of them.
+
+*Fork note:* `default` and `dontAsk` are still accepted as deprecated aliases
+for `autonomous` (with a notice), so launchers built against the old names keep
+starting; they select the mode and nothing else. `acceptEdits` is a real mode
+again, with Claude Code's meaning. It was an alias for `autonomous` until
+WI-1272. See [docs/trust.md](docs/trust.md#acceptedits).
+
 
 Full detail, including the zone table and what is deliberately *not* protected:
 [docs/trust.md](docs/trust.md).
@@ -368,7 +692,9 @@ Klaudia defaults to the Anthropic Messages API. A project or user
 ```toml
 # "anthropic" (default) | "openai"
 provider = "openai"
-model = "openai/gpt-5.5"
+# Sent exactly as written — the id the endpoint lists, with no provider prefix
+# unless the endpoint's own ids have one (OpenRouter's "openai/gpt-5").
+model = "gpt-5.5"
 
 # OpenAI-compatible endpoint.
 baseURL = "https://api.example.com/v1"
@@ -377,6 +703,12 @@ baseURL = "https://api.example.com/v1"
 # Or set apiKey = "sk-..." inline — but the env form keeps secrets out of files.
 apiKeyEnv = "MY_API_KEY"
 
+# extraHeadersEnv maps a header name -> the NAME of an env var holding its value.
+# Applied to every request (alongside Authorization when a key is set); for endpoints
+# gated by non-bearer headers such as a Cloudflare Access service token. With no
+# apiKey/apiKeyEnv, the endpoint is authenticated by these headers alone.
+extraHeadersEnv = { "CF-Access-Client-Id" = "CF_ID", "CF-Access-Client-Secret" = "CF_SECRET" }
+
 # Optional: set the model's context window in tokens so autocompaction kicks
 # in before the provider overflows. Defaults to 200000 (Anthropic-sized); set
 # this when running against smaller-context models (e.g. 128000 for many
@@ -384,11 +716,31 @@ apiKeyEnv = "MY_API_KEY"
 # "max_tokens must be at least 1, got -N" or "context length exceeded" 400s.
 # contextWindow = 128000
 
-# Optional: cap the tokens a single turn may generate. Defaults to the model's
-# real maximum (128000 on the 1M-context Claude models, 64000 on the 200k ones,
-# 8192 for models Klaudia doesn't recognise — including most OpenAI-compatible
-# ones). Set this when your provider's limit differs from that fallback.
+# Optional: cap the tokens a single turn may generate. On Anthropic it defaults
+# to the model's real maximum (128000 on the 1M-context Claude models, 64000 on
+# the 200k ones, 8192 for models Klaudia doesn't recognise); with
+# provider = "openai" it is always 8192. Set this when your provider's limit
+# differs from that fallback.
 # maxTokens = 32000
+
+# Optional: reasoning effort (low | medium | high | xhigh | max). Unset sends
+# none and the model uses its own default. --effort and /effort override it.
+# Anthropic receives it as output_config.effort; OpenAI-compatible endpoints as
+# reasoning_effort, with xhigh and max sent as high. A level the model doesn't
+# support is lowered to its highest (or dropped, on Haiku 4.5 / Sonnet 4.5).
+# effort = "xhigh"
+
+# Optional (Anthropic): "adaptive" or "disabled". Unset sends no thinking
+# parameter, so each model runs its default — adaptive on Opus 5, Sonnet 5 and
+# Fable, none on Opus 4.8 and older. "disabled" is ignored where the model
+# cannot turn thinking off (Fable, Opus 5.5, Opus 5 at xhigh/max).
+# thinking = "adaptive"
+
+# Optional: a model to fall back to. When the model is overloaded (529/503,
+# after the usual retries) the request is retried once on this model; when the
+# provider says the model does not exist, the rest of the session uses this
+# model. Unset, either error ends the turn. --fallback-model overrides it.
+# fallbackModel = "sonnet"
 
 # Optional: what the Return key does at the prompt. "send" (default) submits
 # and ctrl+j / alt+Return insert a newline; "newline" swaps them. See
@@ -396,18 +748,44 @@ apiKeyEnv = "MY_API_KEY"
 # terminals cannot send one.
 # [input]
 # enter = "newline"
+
+# Optional: how Klaudia gets your attention when it needs you (a turn finished,
+# a prompt is waiting). A comma-separated list of "bell" (terminal bell), "osc9"
+# (iTerm2/kitty/WezTerm desktop notification) and "osc777" (rxvt/urxvt); "all"
+# enables every mechanism and "off" disables them. Defaults to "bell". See
+# "Attention notifications" above.
+# [tui]
+# notify = "bell,osc9"
+# cursor = "blink"   # default "steady": a blinking cursor never lets the terminal go quiet
+# title = "off"      # default "on": the terminal title tracks ready/working/awaiting approval
 ```
 
 Create a commented starter config with `./klaudia --create-config=global` for
 `~/.klaudia/config.toml`, or `./klaudia --create-config=local` for
 `./.klaudia/config.toml`.
 
-`--model haiku|sonnet|opus` (or a full model ID) overrides per-run. The
+`--model haiku|sonnet|opus` (or a full model ID) overrides per-run, as `--effort`
+does for `effort`, and `--fallback-model` sets the fallback the same way. A
+switch to the fallback is announced in the TUI, and on stderr (`note: …`) in
+`-p` runs. It is never made once part of the reply has been shown — a second
+request would show it twice — and it covers sub-agents and compaction summaries
+too, since they go through the same provider. The aliases and the Claude default
+model belong to the Anthropic provider: with `provider = "openai"` the model
+string is sent exactly as written (a bare `sonnet` gets a warning, not a
+rewrite), and a `model` is required. The
 OpenAI-compatible provider translates the Anthropic message shape to Chat
 Completions (including image tool-results → `image_url`).
 
-`~/.klaudia/config.toml` is the user default; a project `./.klaudia/config.toml`
-overlays it (project wins). Settings merge per field.
+`~/.klaudia/config.toml` (or `$KLAUDIA_CONFIG_DIR/config.toml`) is the user
+default; a project `./.klaudia/config.toml` overlays it (project wins). Settings
+merge per field. The provider, endpoint and key settings apply from a project
+file only once the folder is trusted (see
+[Create a config](#create-a-config-optional-but-recommended)).
+
+A config file that does not parse stops Klaudia before anything runs (exit 2),
+with the file, line and column. A key Klaudia does not know — a typo, or a
+setting from a newer or older version — is skipped with a warning naming the
+file and line; the rest of the file still applies.
 
 ### Auth
 
@@ -459,11 +837,26 @@ check auth, tools and environment.
 `.klaudia/config.toml` → `sandbox.mode`:
 
 - `local` (default) — run on the host, unconfined.
-- `os` — host confinement: `sandbox-exec` (macOS) / `bubblewrap` (Linux). Reads
-  are unrestricted; writes limited to cwd + temp (+ `writeRoots`); `network`
-  configurable. Falls back to local with a warning if the tool is absent.
+- `os` — host confinement: `sandbox-exec` (macOS) / `bubblewrap` (Linux). Writes
+  are limited to cwd + temp (+ `writeRoots`); `network` configurable. Reads are
+  unrestricted except for your credentials — `~/.ssh` (known_hosts and config
+  stay visible), `~/.aws`, `~/.gnupg`, `~/.kube/config`, `~/.netrc`, `~/.npmrc`,
+  `~/.docker/config.json`, gcloud/azure/gh/1Password config and the like — which
+  commands cannot read. Set `readCredentials = true` when commands in the
+  sandbox need them (git over ssh, the aws or kubectl CLIs). Falls back to
+  local with a warning if the tool is absent or cannot run (bwrap needs
+  unprivileged user namespaces); set `failIfUnavailable = true` to refuse to
+  start instead.
 - `container` — run inside docker/podman (`runtime`, `image`, `mountCwd`,
   `readOnly`, `network`).
+
+`sandbox.memoryMax` (e.g. `"4G"`, `"512M"`; opt-in, any mode) caps the memory
+one Bash command and everything it starts may use, swap included, so a runaway
+command is OOM-killed on its own. In container mode it is `--memory`. On Linux
+otherwise it is a cgroup made by `systemd-run --user --scope`, which needs a
+systemd user session with the memory controller delegated (the default on
+current distros); Klaudia checks at startup that the limit is really enforced
+and warns, running commands without it, when it is not — as it does on macOS.
 
 ## Web search & browsing
 
@@ -495,7 +888,14 @@ increasing precedence: **global** `~/.klaudia/.mcp.json` (honours
 `.klaudia/.mcp.json`. Per server name, the narrower scope wins — a project can
 point a globally configured server at a different binary without disturbing it
 elsewhere. Put personal servers you want everywhere in the global file, and
-servers belonging to a repo in the project's. A server is **stdio** (`command` +
+servers belonging to a repo in the project's. The two project files come with
+the checkout and a stdio server in one is a command Klaudia runs, so their
+servers start only in a folder you have trusted (`klaudia --trust-project`, or
+`--trusted-project-config` from a launcher that wrote the file); elsewhere they
+are listed in a warning and not started. Servers start in parallel, each with
+30 seconds to answer (`KLAUDIA_MCP_CONNECT_TIMEOUT`); a tool call gets ten
+minutes (`KLAUDIA_MCP_TOOL_TIMEOUT`, or `"timeout"` in seconds on the server).
+A server is **stdio** (`command` +
 `args`) or **HTTP** (`url`, with `type:"sse"` for the legacy SSE transport).
 `//` and `/* */` comments are allowed; a file that still doesn't parse is
 reported — naming the file, since all three share a base name — rather than
@@ -504,7 +904,9 @@ silently loading nothing:
 ```jsonc
 { "mcpServers": {
   "local":  { "command": "my-server", "args": ["--stdio"] },
-  "remote": { "type": "http", "url": "https://mcp.example.com/v1" }
+  "remote": { "type": "http", "url": "https://mcp.example.com/v1",
+              "headers": { "Authorization": "Bearer ${EXAMPLE_TOKEN}" },
+              "alwaysLoad": true }
 } }
 ```
 
@@ -516,7 +918,66 @@ servers alone, so a half-typed file can't take working tools away; the reload
 is otherwise silent, so check `/mcp` if a server doesn't appear.
 
 Their tools appear as `mcp__<server>__<tool>`, auto-deferred behind `ToolSearch`.
-In the TUI, `/mcp` lists servers and reconnects/disconnects them.
+In the TUI, `/mcp` lists servers and reconnects/disconnects them. A server that
+announces `tools/list_changed` has its list re-fetched and folded in live, so a
+tool that appears or disappears mid-session needs no restart.
+
+**Prompts as slash commands.** A server's MCP prompts (`prompts/list`) become
+`/mcp__<server>__<prompt>` commands in the TUI. Running one fetches the prompt
+(`prompts/get`) and submits its rendered text as the turn. Arguments take
+`key=value` tokens, and bare text fills the prompt's first required argument, so
+`/mcp__wiki__review the login flow` works without ceremony.
+
+**OAuth for remote servers.** A remote (`url`) server can authorize with OAuth
+2.1 via an `oauth` block. Secrets are named by environment variable, never
+written in the file:
+
+```jsonc
+{ "mcpServers": {
+  "remote": {
+    "type": "http", "url": "https://mcp.example.com/v1",
+    "oauth": {
+      "grant": "client_credentials",
+      "tokenUrl": "https://auth.example.com/oauth/token",
+      "clientId": "klaudia",
+      "clientSecretEnv": "MCP_REMOTE_SECRET",
+      "scopes": ["mcp"]
+    }
+  }
+} }
+```
+
+The `client_credentials` grant is complete: Klaudia mints and refreshes tokens on
+its own. The `authorization_code` grant (fields `authUrl`/`redirectUrl`) has token
+storage and refresh working — a token is persisted under
+`~/.klaudia/mcp-oauth/<server>.json` (0600) and refreshed transparently — but the
+interactive browser step that first obtains a token is not yet wired, so until
+then such a server connects unauthenticated.
+
+### Elicitation
+
+Klaudia speaks protocol **2026-07-28**, which lets a server ask *you* for
+something mid-call — a token it has no other way to obtain, a branch name, a
+yes/no before something destructive. The question arrives at the same prompt the
+model's own `AskUserQuestion` uses, labelled with the server that asked. Each
+field in the server's schema is one question; booleans and enums become choices,
+anything else is typed. You can always skip an optional field or cancel the
+whole form, and cancelling tells the server you cancelled rather than handing it
+a guess.
+
+Two deliberate limits. Only **form** elicitation is supported, and only form is
+advertised: the spec's other mode hands the client a URL to open out of band,
+which a terminal cannot do without reaching outside the project, and a server
+told "yes" for a link that was only printed into scrollback is worse off than one
+that was told no. And **headless runs advertise nothing**, because there is
+nobody to ask — a server that sees no elicitation capability takes its own
+non-interactive path instead of waiting for an answer that is never coming.
+
+The legacy HTTP+SSE transport (`type:"sse"`) still works, but the spec has
+deprecated it in favour of streamable HTTP and servers drop it on their own
+schedule. `/doctor` warns when a configured server is still on it, because the
+symptom otherwise is a connect error that says nothing about the one word that
+fixes it.
 
 The **read-only sub-agents get read-only MCP tools**. Fanning out across a wiki,
 an issue tracker and a chat archive is what `Explore` and `Plan` are for, and it
@@ -542,12 +1003,34 @@ to decline to take a server's word, without giving up the server: the main agent
 keeps it and still asks before every call. This decides which tools a read-only
 sub-agent is *handed*; it is not a claim that calling them is safe.
 
-There is no `${VAR}` expansion — a value is used exactly as written — but the
-server subprocess inherits Klaudia's environment, so export credentials in your
-shell rather than writing them into the file. `.mcp.json.example` is a working
+`command`, `args`, `env` values and `url` may reference Klaudia's environment
+as `${VAR}` or `${VAR:-default}` — the syntax the reference MCP clients accept,
+so a `.mcp.json` written for one of them works here unchanged:
+
+```jsonc
+{ "mcpServers": {
+  "loki": { "command": "python", "args": ["-m", "mspagent.mcp.loki"],
+            "env": { "MSP_LOKI_URL": "${MSP_LOKI_URL:-http://loki:3100}" } }
+} }
+```
+
+A reference to a variable that is unset and has no default is an error for that
+server (named in the transcript and in `/mcp`; the other servers still start),
+not an empty string — an empty value would vanish into the subprocess and
+surface only as the server misbehaving. A bare `$VAR` is not expanded. The
+server subprocess also inherits Klaudia's whole environment, so a credential the
+server reads under its own name needs no `env` entry at all: export it in your
+shell rather than writing it into the file. `.mcp.json.example` is a working
 starting point; copy it and edit. `.mcp.json` itself is gitignored because a
 credential in it would be a literal in a committed file — `git add -f` it if you
 want a secret-free team config in the repo.
+
+A stdio server's stderr is where it logs. In headless (`-p`) and embedding
+runs each line is forwarded to Klaudia's stderr as `mcp[<name>]: …`;
+interactive runs do not, because the TUI owns the terminal. Set
+`KLAUDIA_MCP_STDERR=<dir>` to also append each server's stderr to
+`<dir>/<name>.log`, in any mode. A server that fails to start has the tail of its
+stderr appended to its connect error.
 
 Worth pairing with the `readOnly` guidance above: `-r` and `-S` on the server
 command narrow what exists at all, and `readOnly` decides who is handed it.
@@ -561,8 +1044,24 @@ Klaudia talks to **language servers you already have installed** to give the
 agent real code intelligence:
 
 - `Diagnostics` — compiler/linter errors for a file (the edit → check → fix
-  loop).
-- `Definition` / `References` — jump to a symbol's definition or find its uses.
+  loop). A server that doesn't report within 10s (still starting or indexing)
+  is returned as an error, not as a clean file.
+- `Definition` / `References` / `Implementation` — jump to a symbol's
+  definition, find its uses, or find the concrete implementations of an
+  interface.
+- `Hover` — the type, signature, and docs a server shows on hover.
+- `DocumentSymbols` — an outline of the functions, types, and methods in a file.
+- `WorkspaceSymbol` — find a symbol by name anywhere in the project, when the
+  agent knows what it's called but not which file declares it. Given a `file`,
+  that file's language server answers; without one, every language whose
+  project file (`go.mod`, `Cargo.toml`, `package.json`, …) is at the workspace
+  root is searched.
+- `Rename` — a preview of the edits a symbol rename would make across the
+  workspace (it returns the edits; it does not apply them).
+
+Location, symbol, and hover results include the source line's text alongside
+its `file:line`, so the agent sees the code without a follow-up read. A server
+that lacks a capability is reported as "not supported" rather than failing.
 
 Servers are **detected, never downloaded** — looked up on `$PATH` *and* in the
 usual toolchain locations (so `gopls` in `~/go/bin`, `rust-analyzer` in
@@ -578,6 +1077,42 @@ Recognised today: `gopls` (Go), `rust-analyzer` (Rust),
 disabled = ["python"]
 ```
 
+## Project instructions
+
+Instructions are read into the system prompt from, farthest first so the
+closest have the last word:
+
+- `~/.claude/CLAUDE.md` and `~/.claude/rules/*.md`;
+- every directory from `/` down to the working directory: its `CLAUDE.md` — or
+  `AGENTS.md` when it has none — then its `.claude/rules/*.md`.
+
+So a workspace-level `CLAUDE.md` above several checkouts applies to all of
+them. A line that is only `@path` is replaced by that file (relative to the
+file it is in; `~/` is home; five levels deep); an `@path` inside a sentence
+stays as written and the file is appended. `@` inside code fences is left
+alone, `<!-- comments -->` are removed, and each file is included once.
+
+## Sub-agents
+
+Besides the built-in `general-purpose`, `Explore` and `Plan`, sub-agents can be
+defined as markdown files — the same format Claude Code and its plugins use —
+in `~/.claude/agents/`, `~/.klaudia/agents/`, `.claude/agents/` or
+`.klaudia/agents/` (later wins; a file can replace a built-in):
+
+```markdown
+---
+name: code-reviewer
+description: Reviews a diff for bugs, error handling and style
+tools: Read, Grep, Glob      # optional; omitted means every tool
+model: sonnet                # optional; "inherit" or omitted uses the parent's
+---
+You are a code reviewer. …
+```
+
+The model picks one by its description through the Agent tool; `/agents` lists
+them. A sub-agent runs under the session's permissions, whatever its `tools`
+say. On an OpenAI-compatible provider a Claude `model` is ignored.
+
 ## Skills
 
 Skills are read from four directories, in increasing precedence — so a project
@@ -587,15 +1122,26 @@ skill overrides an installed one of the same name:
 ~/.claude/skills/     ~/.klaudia/skills/     .claude/skills/     .klaudia/skills/
 ```
 
+The two project directories are read at the project root (the git top-level),
+so a launch from a subdirectory still gets the repository's skills; when the
+launch directory is a subdirectory, its own `.claude/skills/` and
+`.klaudia/skills/` are read after the root's and win a name collision.
+
 `.claude` is included because that is where the ecosystem's skill installers
 put things (`anthropics/skills` and friends), for the same reason Klaudia reads
-`~/.claude/CLAUDE.md`. Either layout works in any of them:
+`~/.claude/CLAUDE.md`. `~/.klaudia/skills/` follows `KLAUDIA_CONFIG_DIR` when it
+is set; `~/.claude/skills/` does not. Either layout works in any of them:
 
 ```
 skills/review.md            # one file per skill
 skills/review/SKILL.md      # one directory per skill, for skills that ship
                             # templates, licences or scripts alongside
 ```
+
+`~/.claude/skills/synced/` — where Claude Code keeps the skills it syncs from
+claude.ai — is skipped without a warning, and its skills are not loaded: many
+of them drive claude.ai's own artifacts and connectors and would not work here.
+Copy one you want into `~/.klaudia/skills/`.
 
 They become a `Skill` tool the model can invoke and `/＜name＞` commands in the
 TUI. Body supports `$ARGUMENTS`. `name` defaults to the file's — or the
@@ -609,17 +1155,75 @@ description: Structured review of the current diff
 Review the staged changes carefully. $ARGUMENTS
 ```
 
+Three skills ship inside the binary and are always available:
+
+| Skill | What it does |
+|---|---|
+| `code-review` | Reviews the uncommitted diff (or a branch, range or PR number given as arguments) for real defects, confirming each against the code before reporting it. |
+| `review-pr` | A pre-merge review that gives each aspect — correctness, tests, error handling, comments, design, simplicity — to its own read-only `Explore` sub-agent, then merges and checks the findings. Name aspects in the arguments to run only those. |
+| `feature-dev` | A staged workflow for a non-trivial feature: explore with sub-agents, settle open questions with you, compare designs, implement, then verify and review. |
+
+They follow the shape of Claude Code's `code-review`, `pr-review-toolkit` and
+`feature-dev` plugins, rewritten for Klaudia's tools and sub-agent types (the
+upstream prompts are not open-licensed, so none of their text is used). A skill
+of the same name in any skills directory replaces the bundled one, which is how
+you adapt one to a project.
+
 Loaded skills are listed in the startup banner. A skill's **name and
 description** are in every request; its **instructions** load only when the
 skill is invoked (skill bodies are large, so this is deliberate) — a model
 saying "registered but not loaded" is reporting correct behaviour.
 
-**If a skill doesn't appear at all, run `/doctor`.** With no skills loaded the
-`Skill` tool is not registered at all, so asking the model whether it has skills
-gets an honest "I have no such tool" — which is indistinguishable from the
-feature being missing. `/doctor` reports what loaded, from which scope, and
-names the directories when nothing did. A skill directory without a `SKILL.md`
-warns at startup rather than being skipped in silence.
+**If a skill doesn't appear at all, run `/doctor`.** It reports what loaded and
+from which scope (`bundled`, `user` or `project`), and names the directories
+when none of your own did. A skill directory without a `SKILL.md` warns at
+startup rather than being skipped in silence.
+
+## Hooks
+
+A hook is a shell command run at a fixed point in a turn — the escape hatch for
+things Klaudia should not have an opinion about:
+
+```toml
+# .klaudia/config.toml — or ~/.klaudia/config.toml
+
+[[hooks]]
+event = "PostToolUse"          # run the project's formatter after every write
+matcher = "Edit|Write"
+command = "gofmt -w $(jq -r '.tool_input.file_path') 2>/dev/null"
+
+[[hooks]]
+event = "PreToolUse"           # refuse edits to generated files
+matcher = "Edit|Write"
+command = '''
+case "$(jq -r .tool_input.file_path)" in
+  *.pb.go) echo "generated file — edit the source" >&2; exit 2 ;;
+esac
+'''
+
+[[hooks]]
+event = "UserPromptSubmit"     # stdout is added to the conversation
+command = "echo \"Branch: $(git branch --show-current)\""
+timeout = "5s"
+```
+
+Four events, deliberately: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+`PostToolUse`. The hook is handed a JSON object on stdin using Claude Code's
+field names (`tool_name`, `tool_input`, `tool_response`, `prompt`, …) so
+existing hook scripts work unedited. Exit **2** blocks and its stderr is the
+reason the model is given; any other non-zero status is a malfunction, reported
+to you and never to the model. stdout becomes context.
+
+**A hook is not a security boundary.** `PreToolUse` runs *after* the host gate
+and permission check have allowed a call, so a hook can narrow what Klaudia will
+do and never widen it. And because a project's `.klaudia/config.toml` arrives
+with a clone, **hooks from a repository are confirmed once** — you are shown
+every command, the decision is remembered in `~/.klaudia/hooks.json`, and
+editing the set asks again. Your own `~/.klaudia/config.toml` hooks run without
+prompting. `/doctor` lists what is attached and warns about a set still waiting
+on approval.
+
+Full semantics: [docs/hooks.md](docs/hooks.md).
 
 ## Themes
 
@@ -637,12 +1241,16 @@ theme = "nord"
 Two complementary modes for working toward an objective:
 
 - **Standing goal** — `/goal <text>` pins an objective re-stated to the model at
-  the start of every turn so it doesn't drift; `/goal clear` removes it.
+  the start of every turn so it doesn't drift; `/goal clear` removes it. It is
+  kept beside the session's transcript, so resuming the session restores it
+  (and the resume banner shows it).
 - **Goal spec + Ralph loop** — for bigger objectives:
   - `/goal` (no args) enters **goal-setting**: it loads an existing spec
-    (`./PRD.md` or `./.klaudia/GOAL.md`) or, if none, helps you draft one
-    (objective, an acceptance-criteria checklist, and a verification command).
-    `/goal` again finishes.
+    (`./.klaudia/GOAL.md`, or `./PRD.md` if it has a spec's shape — at least one
+    `- [ ]` checklist item and a `## Verify` section) or, if none, helps you
+    draft `.klaudia/GOAL.md` (objective, an acceptance-criteria checklist, and a
+    verification command). A `PRD.md` without that shape is left alone, and
+    Klaudia says why. `/goal` again finishes.
   - `/goal run [N]` then runs an **autonomous loop** against the spec: each
     iteration re-reads the spec, makes the next valuable change, verifies, and
     commits — progress accumulating in files and git, not the context window
@@ -661,23 +1269,117 @@ Two complementary modes for working toward an objective:
     two checks — a mechanical count of remaining `- [ ]` items, and a one-shot
     verification turn that re-reads the spec from disk and cross-references it
     against git/build/tests — and only honours completion if both agree.
-  - Headless/scriptable: `klaudia --loop --dangerously-skip-permissions
-    [--max-iterations N]` runs the same loop without the TUI (each iteration with
-    a fresh context). It needs a spec in the cwd and bypass permissions (no human
-    to approve), and also stops if it stalls (no new commits for a few
-    iterations).
+  - **Your uncommitted work is not the loop's to discard.** The loop runs
+    alongside whatever is already uncommitted — no clean tree needed — and
+    leaves it exactly as it was, uncommitted. For the whole run it is refused
+    any `git checkout --`, `git restore`, `git reset --hard`, `git clean -f`,
+    `git stash`, `git rm -f` or forced switch that could reach a file that was
+    dirty (or untracked) when it started, and any `git add -A`/`.`/`-u`,
+    `git commit -a` or `git add <that file>` that would sweep it into the
+    loop's own commits — in every permission mode. It commits only what it
+    changed. Opt-ins: `/goal run [N] commit` commits the pre-existing changes
+    to the goal branch first, as a commit of their own; `/goal run [N] refuse`
+    does not start if there are any.
+  - The loop is `/goal run` in the TUI and `--loop` on the command line;
+    there is no `klaudia goal` subcommand (`klaudia goal run` is refused rather
+    than run as a prompt).
+  - Headless/scriptable: `klaudia --loop --permission-mode autonomous
+    [--max-iterations N] [--loop-dirty allow|commit|refuse]` runs the same loop
+    without the TUI (each iteration with a fresh context). It needs a spec in
+    the cwd and a mode that does not ask (`autonomous`, or
+    `--dangerously-skip-permissions`), and also stops if it stalls (no new
+    commits for a few iterations).
+  - **Goals whose output is not a diff.** For an analysis backlog whose
+    product is reports, packets or status files (often gitignored), the
+    branch and the commit per iteration are noise. `/goal run [N] no-branch`
+    stays on the current branch; `no-commit` leaves each iteration's work
+    uncommitted for you to review; `artifact` (or a line `mode: artifact` in
+    the spec) is both. In no-commit mode progress is the spec itself: the loop
+    stops as stalled when its Progress section stops changing, not when HEAD
+    does. Headless: `--no-branch`, `--no-commit`. (`commit` for pre-existing
+    changes needs a goal branch, so it cannot be combined with `no-branch`.)
+
+## Project instructions (AGENTS.md / CLAUDE.md)
+
+Klaudia reads both, at three levels, in increasing precedence — generic first
+at each level, so an agent-specific file reads as the refinement:
+
+```
+~/.claude/CLAUDE.md   ~/.klaudia/AGENTS.md   <git root>/AGENTS.md   <git root>/CLAUDE.md   ./AGENTS.md   ./CLAUDE.md
+```
+
+[AGENTS.md](https://agents.md) is the cross-agent standard; `CLAUDE.md` is the
+Claude-family one. Both are read because a repo may carry either or both, and
+ignoring one silently drops instructions the user wrote for exactly this
+purpose. `~/.claude` is included for the same reason skills are read from
+there: that is where the ecosystem puts things.
+
+If you support both with a symlink (`ln -s AGENTS.md CLAUDE.md`) or a copy, the
+contents are sent once, not twice — identity is established by resolved path
+*and* by content hash. The prompt's section header names the files it actually
+used, so asking Klaudia to "write that down" puts it in the right one.
 
 ## Memory & project knowledge
 
 - **Auto-memory** — the `Memory` tool stores and recalls notes. `.klaudia/MEMORY.md`
   is the index (session bullets); longer notes live as `.klaudia/memory/*.md`
   detail files. The index keeps a `## Linked memory` section pointing at those
-  files (name + one-line hook), kept in sync automatically. Only the index is
-  recalled into the prompt — cheap as memory grows — and the model opens a
-  detail note on demand. `Memory` search spans both the index and the detail
-  notes (a hit is tagged with its filename).
+  files (name + one-line hook: the note's frontmatter `description`, else its
+  first line after any frontmatter), kept in sync automatically. Only the index
+  is recalled into the prompt — capped at 200 lines / 25 KB, with a line saying
+  how much was left out — and the model opens a detail note on demand. `Memory`
+  search spans both the index and the detail notes (a hit is tagged with its
+  filename); `remove` forgets one session note (by `query`) or a detail note
+  (by `name`).
 - **Project knowledge** — `.klaudia/KNOWLEDGE.md` (curated, durable lessons) is
-  injected into the system prompt when present.
+  injected into the system prompt when present, framed as project notes to weigh
+  against the code rather than as facts. Because every later session reads it,
+  the `Memory` tool asks before writing it (`add` with `scope=project`, and
+  `promote`) — in autonomous mode too. A headless run, with no one to ask,
+  refuses such a write; plain `MEMORY.md` notes need no approval.
+- Both live in the project root's `.klaudia/` (the git top-level; the launch
+  directory outside a repository), so a launch from a subdirectory shares them.
+  A subdirectory's own `.klaudia/MEMORY.md` and `KNOWLEDGE.md`, from before
+  memory was keyed by the root, are still recalled after the root's.
+
+## Environment variables
+
+Every `KLAUDIA_*` and `ANTHROPIC_*` variable Klaudia reads. Where a
+`.klaudia/config.toml` key covers the same setting (the `[browser]` keys), the
+config file wins over the variable. Boolean variables take `1`/`true`/`yes`/`on`
+or `0`/`false`/`no`/`off`; any other value is ignored, as is a number that does
+not parse.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | unset | Anthropic API key, sent as `x-api-key`. Wins over every other Anthropic credential. |
+| `ANTHROPIC_AUTH_TOKEN` | unset | Bearer token for the Anthropic API, used when `ANTHROPIC_API_KEY` is unset; wins over the Claude Code Keychain session. |
+| `ANTHROPIC_BASE_URL` | unset (Anthropic's production API) | Base URL for the native Anthropic provider. `baseURL` in `config.toml` wins over it, and so does `KLAUDIA_CUSTOM_ENDPOINT`. |
+| `KLAUDIA_CUSTOM_ENDPOINT` | unset | Base URL for the Anthropic provider (a proxy or gateway), from `--custom-endpoint`. The OpenAI-compatible provider uses `baseURL` in `config.toml` instead. |
+| `KLAUDIA_MAX_RETRIES` | `5` | Retries for a failed model request (429, 5xx, dropped connection), with exponential backoff that honours `Retry-After`. A non-negative integer. |
+| `KLAUDIA_STREAM_IDLE_TIMEOUT` | `120` | Seconds a streamed turn may go without an event before it counts as stalled (see [Streaming & reliability](#streaming--reliability)). `0` disables the watchdog. |
+| `KLAUDIA_DISABLE_PROMPT_CACHE` | unset (caching on) | Any non-empty value — even `0` — stops Klaudia marking prompt-cache breakpoints on Anthropic requests, so every turn re-sends and is billed for the whole prompt. |
+| `KLAUDIA_CONFIG_DIR` | `~/.klaudia` | Base directory for per-user state: sessions, tool-output spills, job logs, the Chrome profile and the user-level `.mcp.json`. `config.toml` and user skills are still read from `~/.klaudia`. |
+| `KLAUDIA_LOG` | unset (discarded) | File to append the standard `log` package's output to while the TUI runs (see [Logs & diagnostics](#logs--diagnostics)). |
+| `KLAUDIA_BROWSER_LOG` | unset | File to append chromedp's unfiltered browser/protocol log to. |
+| `KLAUDIA_MCP_STDERR` | unset | Directory to append each stdio MCP server's stderr to, as `<name>.log`, in any mode. |
+| `KLAUDIA_WEB_SEARCH_ENGINE` | `ddg` | `BrowserSearch` engine: `ddg` (DuckDuckGo) or `google`. Config: `browser.searchEngine`. |
+| `KLAUDIA_CHROME_PATH` | auto-discovered | Chrome/Chromium executable to launch. Config: `browser.chromePath`. |
+| `KLAUDIA_CHROME_REMOTE_URL` | unset (launch Chrome) | DevTools endpoint of a running Chrome to attach to instead of launching one. Config: `browser.remoteUrl`. |
+| `KLAUDIA_CHROME_USER_DATA_DIR` | `<config dir>/browser/chrome-profile` | Chrome profile directory (cookies, the solved-challenge state). Config: `browser.userDataDir`. |
+| `KLAUDIA_BROWSER_HEADLESS` | `true` | Run the launched Chrome headless. Config: `browser.headless`. |
+| `KLAUDIA_BROWSER_HEADED_FALLBACK` | `true` | On a search bot-challenge page, relaunch a headed Chrome so you can solve it once. Config: `browser.headedFallback`. |
+| `KLAUDIA_CURSOR_BLINK` | unset (steady) | `1`/`true`/`on`/`yes` makes the TUI input cursor blink; `0`/`false`/`off`/`no` keeps it steady. Wins over `[tui] cursor` in `config.toml` when set. |
+| `KLAUDIA_DUMP_FAILED_REQUEST` | unset (off) | File to append a redacted copy of a request the endpoint rejected. Headers are dropped and message text is replaced by its length, so the dump shows the request's shape, not its content. |
+| `KLAUDIA_MCP_CONNECT_TIMEOUT` | `30` | Seconds a stdio MCP server has to finish its handshake. A positive integer. |
+| `KLAUDIA_MCP_TOOL_TIMEOUT` | `600` | Seconds one MCP tool call may take, unless the server's own `timeout` in `.mcp.json` says otherwise. A positive integer. |
+| `KLAUDIA_CODEXSUB_DEPTH` | unset (`0`) | How many `klaudia mcp codex-subagent` servers are already stacked above this one. The server sets it in the child's environment and refuses to spawn once it passes `--max-depth`. |
+| `KLAUDIA_PROC_TAG` | unset | Set by Klaudia on the commands it runs, never by you. It marks a command's processes so that cancelling the command can still reach one that left its process group. |
+
+Variables you name yourself — `apiKeyEnv`, `extraHeadersEnv`, `${VAR}` in
+`.mcp.json` — are not listed. `cmd/klaudia/envdocs_test.go` keeps this table
+honest: it fails when non-test code names a `KLAUDIA_*` or `ANTHROPIC_*`
+variable that has no row here, or a row names one no code reads.
 
 ## Internal package layout
 
@@ -687,19 +1389,22 @@ Two complementary modes for working toward an objective:
 | `api` | provider abstraction (Anthropic client + OpenAI-compatible shim) |
 | `tools` | local tool implementations |
 | `browser` | lazy headless-Chrome engine + web search |
-| `lsp` | language-server client for code intelligence (Diagnostics/Definition/References) |
-| `permission` | the three permission modes + the deprecated allow/deny rules (a leaf package) |
+| `lsp` | language-server client for code intelligence (Diagnostics/Definition/References/WorkspaceSymbol) |
+| `permission` | the three permission modes (a leaf package) |
 | `trust` | zones, command/tool classification, session-scoped grants |
 | `session` | JSONL transcripts, resume, persisted summaries |
 | `compaction` | micro + auto context compaction |
-| `mcp` | Model Context Protocol client |
+| `mcp` | Model Context Protocol client (2026-07-28) + form elicitation |
 | `subagent` | built-in sub-agent types |
+| `worktree` | per-sub-agent git checkouts: seed, adopt, conflict reporting |
 | `skill` | user-defined skills |
+| `hooks` | lifecycle hooks: events, project-hook trust, execution |
 | `memory` | auto-memory store |
 | `goal` | standing goals, goal specs, and the Ralph loop |
 | `doctor` | `/doctor` environment diagnostics |
 | `sandbox` | local / OS-confined / container Bash execution |
 | `streamjson` | bidirectional stream-json frontend |
+| `acp` | Agent Client Protocol v1 agent (editor-driven sessions) |
 | `tui` | Bubble Tea terminal UI |
 | `cli` | command entry, flags, wiring |
 | `native` | pure-Go search / bash-parsing / PDF |
@@ -711,8 +1416,11 @@ Two complementary modes for working toward an objective:
 - [docs/ux-spec.md](docs/ux-spec.md) — the terminal-UX specs, and where the
   implementation deliberately departs from them
 - [docs/trust.md](docs/trust.md) — the host boundary, zones, and what is *not* protected
+- [docs/hooks.md](docs/hooks.md) — lifecycle hooks, and why project hooks are confirmed
 - [docs/jobs.md](docs/jobs.md) — the job model, logs, and its limits
-- [docs/working-tree.md](docs/working-tree.md) — change ownership, `/commit`, `/undo`
+- [docs/working-tree.md](docs/working-tree.md) — change ownership, `/commit`,
+  `/undo`, and the sub-agent checkouts
+- [docs/acp.md](docs/acp.md) — the ACP frontend: what is served, and what is declined
 - [docs/parity.md](docs/parity.md) — JS→Go feature map and divergences
 - [docs/compaction.md](docs/compaction.md) — context-window management
 - [docs/memory-architecture.md](docs/memory-architecture.md) — index→detail memory store
@@ -744,14 +1452,15 @@ tools.
   tools of their own (the reference was Anthropic-only, and used its server-side
   `web_search`/`web_fetch` — which Klaudia still prefers on Claude models,
   because their results come back cited).
-- Config and sessions live under `~/.klaudia` (`KLAUDIA_CONFIG_DIR`), not
-  `~/.claude`.
+- Config, skills and sessions live under `~/.klaudia` (or wherever
+  `KLAUDIA_CONFIG_DIR` points), not `~/.claude`.
 - New capabilities with no reference analogue: language-server code intelligence
-  (Diagnostics/Definition/References), OS/container Bash sandboxing, persisted
+  (Diagnostics/Definition/References/WorkspaceSymbol), OS/container Bash sandboxing, persisted
   resume summaries, project `KNOWLEDGE.md`, an index→detail memory store,
   standing goals (`/goal`), chrome-wide themes, managed background jobs with
-  logs, working-tree change ownership (`/changes`, `/undo`), and an autonomy
-  model that stops at the host boundary rather than at each action.
+  logs, working-tree change ownership (`/changes`, `/undo`), per-sub-agent git
+  checkouts, an ACP frontend for editors, and an autonomy model that stops at
+  the host boundary rather than at each action.
 
 ## Roadmap
 

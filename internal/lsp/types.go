@@ -1,7 +1,7 @@
 // Package lsp is a minimal Language Server Protocol client: it detects language
 // servers already installed on the machine (PATH plus well-known toolchain
-// locations), spawns them on demand, and exposes diagnostics, definitions, and
-// references to the agent's tools. It does not download servers.
+// locations), spawns them on demand, and exposes diagnostics, definitions,
+// references, and workspace symbol search to the agent's tools. It does not download servers.
 package lsp
 
 import (
@@ -27,6 +27,33 @@ type Location struct {
 	Range Range  `json:"range"`
 }
 
+// Symbol is one workspace/symbol match. Servers answer with either
+// SymbolInformation or the LSP 3.17 WorkspaceSymbol, whose location may carry a
+// URI without a range; both decode into this shape (a missing range is zero).
+type Symbol struct {
+	Name          string   `json:"name"`
+	Kind          int      `json:"kind"`
+	Detail        string   `json:"detail,omitempty"`        // e.g. a function signature (DocumentSymbol only)
+	ContainerName string   `json:"containerName,omitempty"` // enclosing symbol (parent, or SymbolInformation.containerName)
+	Location      Location `json:"location"`
+}
+
+// symbolKinds are the LSP SymbolKind names, indexed by kind (1-based).
+var symbolKinds = [...]string{
+	"", "file", "module", "namespace", "package", "class", "method", "property",
+	"field", "constructor", "enum", "interface", "function", "variable", "constant",
+	"string", "number", "boolean", "array", "object", "key", "null", "enum member",
+	"struct", "event", "operator", "type parameter",
+}
+
+// SymbolKindName maps an LSP SymbolKind to a short label.
+func SymbolKindName(kind int) string {
+	if kind > 0 && kind < len(symbolKinds) {
+		return symbolKinds[kind]
+	}
+	return "symbol"
+}
+
 // Diagnostic is one problem reported by a server.
 type Diagnostic struct {
 	Range    Range  `json:"range"`
@@ -34,6 +61,26 @@ type Diagnostic struct {
 	Code     any    `json:"code,omitempty"`
 	Source   string `json:"source,omitempty"`
 	Message  string `json:"message"`
+}
+
+// Hover is a decoded textDocument/hover result: the server's info text and,
+// when the server supplied one, the range the hover applies to.
+type Hover struct {
+	Text  string
+	Range *Range
+}
+
+// TextEdit is a single edit: replace Range with NewText.
+type TextEdit struct {
+	Range   Range  `json:"range"`
+	NewText string `json:"newText"`
+}
+
+// FileEdits groups the edits a rename makes to one file. Rename results are
+// returned as a preview — the caller decides whether to apply them.
+type FileEdits struct {
+	URI   string
+	Edits []TextEdit
 }
 
 // SeverityName maps an LSP severity to a short label.

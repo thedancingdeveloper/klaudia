@@ -39,8 +39,8 @@ func TestToolsReceiveTheWorkingDir(t *testing.T) {
 	l := New(nil, tools.NewRegistry(capture))
 	tu := anthropic.BetaToolUseBlock{ID: "t1", Name: "Capture", Input: map[string]any{}}
 
-	l.dispatch(context.Background(), tu, Options{WorkingDir: "/project/root"},
-		nil, func(...string) {}, map[string]int{}, map[string]errStreak{})
+	l.dispatch(context.Background(), tu, Options{WorkingDir: "/project/root"}, 0,
+		nil, func(...string) {}, newFailureState())
 
 	if capture.got.WorkingDir != "/project/root" {
 		t.Errorf("tool ran with WorkingDir = %q, want the project root", capture.got.WorkingDir)

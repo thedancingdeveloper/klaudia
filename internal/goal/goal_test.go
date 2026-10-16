@@ -18,15 +18,18 @@ func TestSpecPathPrecedence(t *testing.T) {
 		}
 	})
 
-	t.Run("PRD.md wins over .klaudia/GOAL.md", func(t *testing.T) {
+	t.Run(".klaudia/GOAL.md wins over a goal-shaped PRD.md", func(t *testing.T) {
 		dir := t.TempDir()
 		os.MkdirAll(filepath.Join(dir, ".klaudia"), 0o755)
 		os.WriteFile(filepath.Join(dir, ".klaudia", "GOAL.md"), []byte("# Goal\n"), 0o644)
-		os.WriteFile(filepath.Join(dir, "PRD.md"), []byte("# PRD\n"), 0o644)
+		os.WriteFile(filepath.Join(dir, "PRD.md"), []byte(Template("x")), 0o644)
 
 		path, found := SpecPath(dir)
-		if !found || path != filepath.Join(dir, "PRD.md") {
-			t.Errorf("got (%q, %v), want PRD.md found", path, found)
+		if !found || path != filepath.Join(dir, ".klaudia", "GOAL.md") {
+			t.Errorf("got (%q, %v), want .klaudia/GOAL.md found", path, found)
+		}
+		if _, ignored := IgnoredPRD(dir); ignored {
+			t.Error("IgnoredPRD should be quiet when GOAL.md is the spec")
 		}
 	})
 
@@ -40,6 +43,61 @@ func TestSpecPathPrecedence(t *testing.T) {
 			t.Errorf("got (%q, %v), want .klaudia/GOAL.md found", path, found)
 		}
 	})
+
+	t.Run("a goal-shaped PRD.md is adopted", func(t *testing.T) {
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "PRD.md"), []byte(Template("ship it")), 0o644)
+
+		path, found := SpecPath(dir)
+		if !found || path != filepath.Join(dir, "PRD.md") {
+			t.Errorf("got (%q, %v), want PRD.md found", path, found)
+		}
+		if _, ignored := IgnoredPRD(dir); ignored {
+			t.Error("IgnoredPRD should be quiet when PRD.md was adopted")
+		}
+	})
+
+	// The reported bug: a product PRD that was never written for the loop
+	// became its spec, and wrap-up summaries were written into it.
+	t.Run("an unrelated PRD.md is not adopted", func(t *testing.T) {
+		dir := t.TempDir()
+		prd := filepath.Join(dir, "PRD.md")
+		os.WriteFile(prd, []byte("# Product requirements\n\n## Users\n\nTeams who ...\n"), 0o644)
+
+		path, found := SpecPath(dir)
+		if found || path != filepath.Join(dir, ".klaudia", "GOAL.md") {
+			t.Errorf("got (%q, %v), want the .klaudia/GOAL.md create path, not found", path, found)
+		}
+		if got, ignored := IgnoredPRD(dir); !ignored || got != prd {
+			t.Errorf("IgnoredPRD = (%q, %v), want (%q, true)", got, ignored, prd)
+		}
+	})
+
+	t.Run("no PRD.md: nothing ignored", func(t *testing.T) {
+		if _, ignored := IgnoredPRD(t.TempDir()); ignored {
+			t.Error("IgnoredPRD reported a PRD.md that does not exist")
+		}
+	})
+}
+
+func TestIsGoalSpec(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"template", Template("x"), true},
+		{"ticked items and Verification heading", "# G\n\n- [x] done\n* [X] also\n\n### Verification\n\n`make test`\n", true},
+		{"checklist without verify", "# PRD\n\n- [ ] login\n", false},
+		{"verify without checklist", "# PRD\n\n## Verify\n\nmake test\n", false},
+		{"plain list is not a checklist", "# PRD\n\n- login\n\n## Verify\n\nmake\n", false},
+		{"verify in prose is not a section", "- [ ] a\n\nWe verify by hand.\n", false},
+	}
+	for _, tc := range cases {
+		if got := IsGoalSpec(tc.text); got != tc.want {
+			t.Errorf("%s: IsGoalSpec = %v, want %v", tc.name, got, tc.want)
+		}
+	}
 }
 
 func TestRead(t *testing.T) {
@@ -47,9 +105,10 @@ func TestRead(t *testing.T) {
 	if text, _, err := Read(dir); err != nil || text != "" {
 		t.Fatalf("Read with no spec = (%q, %v), want empty", text, err)
 	}
-	os.WriteFile(filepath.Join(dir, "PRD.md"), []byte("hello"), 0o644)
+	os.MkdirAll(filepath.Join(dir, ".klaudia"), 0o755)
+	os.WriteFile(filepath.Join(dir, ".klaudia", "GOAL.md"), []byte("hello"), 0o644)
 	text, path, err := Read(dir)
-	if err != nil || text != "hello" || path != filepath.Join(dir, "PRD.md") {
+	if err != nil || text != "hello" || path != filepath.Join(dir, ".klaudia", "GOAL.md") {
 		t.Fatalf("Read = (%q, %q, %v)", text, path, err)
 	}
 }
@@ -137,6 +196,9 @@ func TestPromptsReferenceSpecPath(t *testing.T) {
 	it := IterationPrompt(p)
 	if !contains(it, p) || !contains(it, CompleteToken) {
 		t.Error("iteration prompt should reference the spec path and completion token")
+	}
+	if !contains(it, "git reset --hard") || !contains(it, "only files you changed") {
+		t.Error("iteration prompt should forbid discarding pre-existing changes (#250)")
 	}
 	w := WrapUpPrompt(p)
 	if !contains(w, p) || !contains(w, "Do NOT make code changes") {
@@ -269,4 +331,51 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+func TestSpecMode(t *testing.T) {
+	for _, spec := range []string{
+		"---\nmode: artifact\n---\n# Goal\n",
+		"# Goal\n\nMode: artifact\n\n- [ ] x\n",
+		"# Goal\n\n**Mode:** artifact\n",
+	} {
+		if got := SpecMode(spec); got != Artifact {
+			t.Errorf("SpecMode(%q) = %+v, want Artifact", spec, got)
+		}
+	}
+	for _, spec := range []string{
+		"# Goal\n\n- [ ] x\n",
+		"# Goal\n\nThe mode: artifact idea is described below.\n",
+		"# Goal\n\n```\nmode: artifact\n```\n",
+	} {
+		if got := SpecMode(spec); got != (RunMode{}) {
+			t.Errorf("SpecMode(%q) = %+v, want the code mode", spec, got)
+		}
+	}
+	if got := (RunMode{NoCommit: true}).Merge(RunMode{NoBranch: true}); got != Artifact {
+		t.Errorf("Merge = %+v", got)
+	}
+}
+
+func TestPromptsForNoCommit(t *testing.T) {
+	p := "/x/GOAL.md"
+	if IterationPromptFor(p, RunMode{}) != IterationPrompt(p) || WrapUpPromptFor(p, RunMode{}) != WrapUpPrompt(p) {
+		t.Error("the code mode's prompts changed")
+	}
+	if !contains(IterationPrompt(p), "commit your work") {
+		t.Error("the code mode no longer asks for a commit")
+	}
+	nc := RunMode{NoCommit: true}
+	for name, s := range map[string]string{
+		"iteration": IterationPromptFor(p, nc),
+		"wrap-up":   WrapUpPromptFor(p, nc),
+		"stub-fix":  StubFixPromptFor(p, []string{"Phase 2"}, nc),
+	} {
+		if contains(s, "commit your work") || contains(s, "Commit only") || contains(s, "commit only") || contains(s, "and commit it") {
+			t.Errorf("%s prompt asks for a commit under NoCommit:\n%s", name, s)
+		}
+		if !contains(s, "not commit") && !contains(s, "NOT commit") {
+			t.Errorf("%s prompt does not say not to commit:\n%s", name, s)
+		}
+	}
 }

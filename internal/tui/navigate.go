@@ -220,9 +220,12 @@ func (m *Model) showEntry(args []string) tea.Cmd {
 func (m *Model) listErrors(args []string) tea.Cmd {
 	limit := 10
 	if len(args) > 0 {
-		if n, err := strconv.Atoi(args[0]); err == nil && n > 0 {
-			limit = n
+		n, err := strconv.Atoi(args[0])
+		if err != nil || n <= 0 || len(args) > 1 {
+			m.appendLine(errStyle.Render("usage: /errors [n] — n is how many recent errors to list"))
+			return nil
 		}
+		limit = n
 	}
 	var hits []string
 	for i := len(m.nav) - 1; i >= 0 && len(hits) < limit; i-- {
@@ -243,4 +246,44 @@ func (m *Model) listErrors(args []string) tea.Cmd {
 		"%d most recent error(s) — /show <n> for the full output:\n%s",
 		len(hits), strings.Join(hits, "\n"))))
 	return nil
+}
+
+// atTokenStart returns the index of the @ that opens the reference being
+// typed at the end of value, or -1. The @ must begin a word — at the start of
+// the line or after whitespace — so the @ inside an email address or a
+// decorator is left alone.
+func atTokenStart(value string) int {
+	at := strings.LastIndex(value, "@")
+	if at < 0 {
+		return -1
+	}
+	if at > 0 {
+		if r := value[at-1]; r != ' ' && r != '\t' && r != '\n' {
+			return -1
+		}
+	}
+	return at
+}
+
+// atCandidateLine shows the matches an @path Tab is cycling through, under
+// the prompt, for as long as the cycle is live — the input still holds the
+// completion Tab put there. "" when there is no choice to show.
+func (m *Model) atCandidateLine() string {
+	if len(m.cycle.hits) < 2 || m.cycle.last != m.input.Value() {
+		return ""
+	}
+	show := m.cycle.hits
+	more := ""
+	if len(show) > 8 {
+		show, more = show[:8], "  …"
+	}
+	parts := make([]string, len(show))
+	for i, h := range show {
+		if i == m.cycle.idx {
+			parts[i] = "[" + h + "]"
+		} else {
+			parts[i] = h
+		}
+	}
+	return suggestStyle.Render(strings.Join(parts, "  ")+more) + hintStyle.Render("  (Tab for next)")
 }

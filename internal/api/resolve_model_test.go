@@ -50,6 +50,9 @@ func TestContextWindowResolution(t *testing.T) {
 		{"alias resolves to current opus limit", "opus", 0, 1_000_000, ContextSourceModel},
 		{"older opus snapshot still in the table", "claude-opus-4-7", 0, 1_000_000, ContextSourceModel},
 		{"full id matches known limit", "claude-sonnet-4-6", 0, 1_000_000, ContextSourceModel},
+		{"opus 5.5 by full id", "claude-opus-5-5", 0, 1_000_000, ContextSourceModel},
+		{"sonnet 5.5 by full id", "claude-sonnet-5-5", 0, 1_000_000, ContextSourceModel},
+		{"fable 5.1 by full id", "claude-fable-5-1", 0, 1_000_000, ContextSourceModel},
 		{"a 200K model is still reported as 200K", "claude-haiku-4-5", 0, 200_000, ContextSourceModel},
 		{"unknown model, no override → unknown", "openai/gpt-oss-120b", 0, 0, ContextSourceUnknown},
 		{"empty model + no override → DefaultModel's window", "", 0, 1_000_000, ContextSourceModel},
@@ -62,5 +65,28 @@ func TestContextWindowResolution(t *testing.T) {
 				t.Errorf("ContextWindow(%q, %d) = (%d, %q), want (%d, %q)", tc.model, tc.override, limit, source, tc.wantLimit, tc.wantSource)
 			}
 		})
+	}
+}
+
+func TestPreservesThinking(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		want  bool
+	}{
+		{"claude-fable-5-1", true},
+		{"claude-opus-5-5", true},
+		{"claude-opus-5-5-20261001", true}, // a dated snapshot of a listed model
+		{"Claude-Fable-5-1", true},
+		{"claude-opus-5", false}, // a prefix of claude-opus-5-5, not a snapshot of it
+		{"claude-fable-5", false},
+		{"claude-mythos-5-1", false}, // reads the blocks, runs no check
+		{"opus", false},              // aliases resolve first; they are still on 5.0
+		{"fable", false},
+		{"", false},
+		{"openai/gpt-oss-120b", false},
+	} {
+		if got := PreservesThinking(tc.model); got != tc.want {
+			t.Errorf("PreservesThinking(%q) = %v, want %v", tc.model, got, tc.want)
+		}
 	}
 }

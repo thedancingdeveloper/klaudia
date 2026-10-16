@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/greenthread-ai/klaudia/internal/api"
 )
 
@@ -37,7 +39,7 @@ func TestModelNoArgOpensPicker(t *testing.T) {
 	if m.state != stateAwaitingChoice {
 		t.Fatalf("state = %v, want a picker", m.state)
 	}
-	out := visibleText(m.transcript.String())
+	out := visibleText(m.bottomView())
 	for _, want := range []string{"Claude Opus 5", "claude-sonnet-5", "1.0M ctx"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("picker missing %q:\n%s", want, out)
@@ -52,7 +54,7 @@ func TestModelPickerMarksCurrent(t *testing.T) {
 		{ID: "claude-opus-5", DisplayName: "Claude Opus 5"},
 		{ID: "claude-sonnet-5", DisplayName: "Claude Sonnet 5"},
 	})
-	out := visibleText(m.transcript.String())
+	out := visibleText(m.bottomView())
 	sonnet := strings.Index(out, "Claude Sonnet 5")
 	current := strings.Index(out, "(current)")
 	if sonnet < 0 || current < sonnet {
@@ -65,7 +67,7 @@ func TestModelPickerMarksCurrentThroughAlias(t *testing.T) {
 	m := pickerModel(t, nil, nil)
 	m.sess.Model = "opus"
 	m.showModelPicker([]api.ModelInfo{{ID: "claude-opus-5", DisplayName: "Claude Opus 5"}})
-	if !strings.Contains(visibleText(m.transcript.String()), "(current)") {
+	if !strings.Contains(visibleText(m.bottomView()), "(current)") {
 		t.Error("an aliased current model should still be marked")
 	}
 }
@@ -114,7 +116,10 @@ func TestModelWithArgumentStillSetsDirectly(t *testing.T) {
 	}
 }
 
-func TestModelPickerCapsAtNineAndSaysSo(t *testing.T) {
+// The picker used to stop at nine (digits were the only way to choose), which
+// hid most of an OpenAI-compatible endpoint's list. Every model is offered now,
+// and one past the ninth is reachable from the keyboard.
+func TestModelPickerOffersEveryModel(t *testing.T) {
 	many := make([]api.ModelInfo, 15)
 	for i := range many {
 		many[i] = api.ModelInfo{ID: string(rune('a'+i)) + "-model"}
@@ -122,11 +127,15 @@ func TestModelPickerCapsAtNineAndSaysSo(t *testing.T) {
 	m := pickerModel(t, nil, nil)
 	m.showModelPicker(many)
 
-	if len(m.choiceItems) != 9 {
-		t.Errorf("picker offers %d items; digit selection caps at 9", len(m.choiceItems))
+	if len(m.choiceItems) != len(many) {
+		t.Fatalf("picker offers %d items, want all %d", len(m.choiceItems), len(many))
 	}
-	if !strings.Contains(visibleText(m.transcript.String()), "6 more") {
-		t.Error("truncation must be stated, not silent")
+	for i := 0; i < 11; i++ {
+		m = pickerKey(m, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	m = pickerKey(m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.sess.Model != "l-model" {
+		t.Errorf("model = %q, want the twelfth, l-model", m.sess.Model)
 	}
 }
 
@@ -159,6 +168,40 @@ func TestModelWithoutListerReportsCurrent(t *testing.T) {
 	}
 	if !strings.Contains(visibleText(m.transcript.String()), "claude-opus-5") {
 		t.Error("should still report the current model")
+	}
+}
+
+// On a non-Anthropic provider an alias is sent as typed, the Claude table does
+// not size the window, and the confirmation warns (#125).
+func TestModelAliasOnOpenAIPassesThroughAndWarns(t *testing.T) {
+	m := pickerModel(t, nil, nil)
+	m.sess.Provider = "openai"
+	m.sess.ContextWindow, m.sess.ContextWindowSource = 128000, "config override"
+
+	m.handleSlash("/model sonnet")
+
+	if m.sess.Model != "sonnet" || m.sess.ResolvedModel != "sonnet" {
+		t.Errorf("model = %q resolved %q, want sonnet passed through", m.sess.Model, m.sess.ResolvedModel)
+	}
+	if m.sess.ContextWindow != 128000 {
+		t.Errorf("context window = %d; the Claude table must not replace the configured window", m.sess.ContextWindow)
+	}
+	out := visibleText(m.transcript.String())
+	if !strings.Contains(out, "Model set to sonnet") || !strings.Contains(out, "warning:") {
+		t.Errorf("/model <alias> should confirm and warn:\n%s", out)
+	}
+}
+
+func TestModelAliasOnAnthropicResolvesWithoutWarning(t *testing.T) {
+	m := pickerModel(t, nil, nil)
+	m.sess.Provider = "anthropic"
+	m.handleSlash("/model sonnet")
+	if m.sess.ResolvedModel != "claude-sonnet-5" {
+		t.Errorf("resolved = %q, want claude-sonnet-5", m.sess.ResolvedModel)
+	}
+	out := visibleText(m.transcript.String())
+	if !strings.Contains(out, "claude-sonnet-5") || strings.Contains(out, "warning:") {
+		t.Errorf("want a confirmation naming the resolved id and no warning:\n%s", out)
 	}
 }
 
@@ -208,4 +251,48 @@ func TestModelPickerAgainstLiveProvider(t *testing.T) {
 		t.Error("selection did not record a context window")
 	}
 	t.Logf("selected: %s", line)
+}
+
+// /model <id> warns about an id missing from the list /model already fetched,
+// still applies it (an endpoint can serve ids it does not list), and never
+// fetches to find out.
+func TestModelByIDWarnsWhenNotInFetchedList(t *testing.T) {
+	fetched := 0
+	m := pickerModel(t, nil, nil)
+	m.sess.ListModels = func(context.Context) ([]api.ModelInfo, error) {
+		fetched++
+		return []api.ModelInfo{{ID: "claude-opus-5"}, {ID: "claude-sonnet-5"}}, nil
+	}
+	_, cmd := m.handleSlash("/model")
+	model, _ := m.Update(cmd())
+	m = model.(*Model)
+	m.setState(stateIdle) // leave the picker unanswered
+
+	if _, cmd := m.handleSlash("/model claude-sonet-5"); cmd != nil {
+		t.Error("/model <id> should not fetch the list")
+	}
+	if fetched != 1 {
+		t.Errorf("list fetched %d times, want 1", fetched)
+	}
+	if m.sess.Model != "claude-sonet-5" {
+		t.Errorf("model = %q, want the typed id applied anyway", m.sess.Model)
+	}
+	out := visibleText(m.transcript.String())
+	if !strings.Contains(out, "claude-sonet-5 is not in the list") {
+		t.Errorf("expected an unlisted-model warning:\n%s", out)
+	}
+}
+
+func TestModelByIDNoWarningWhenListedOrNothingFetched(t *testing.T) {
+	m := pickerModel(t, nil, nil)
+	// Nothing fetched yet: nothing to check against, so no warning.
+	m.handleSlash("/model claude-anything")
+	if strings.Contains(visibleText(m.transcript.String()), "is not in the list") {
+		t.Error("no list fetched yet, so there should be no warning")
+	}
+	m.knownModels = []api.ModelInfo{{ID: "claude-sonnet-5"}}
+	m.handleSlash("/model claude-sonnet-5")
+	if strings.Contains(visibleText(m.transcript.String()), "is not in the list") {
+		t.Error("a listed id should not warn")
+	}
 }

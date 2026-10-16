@@ -1,0 +1,659 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/anthropics/anthropic-sdk-go"
+
+	"github.com/greenthread-ai/klaudia/internal/api"
+	"github.com/greenthread-ai/klaudia/internal/config"
+	"github.com/greenthread-ai/klaudia/internal/hooks"
+	"github.com/greenthread-ai/klaudia/internal/permission"
+	"github.com/greenthread-ai/klaudia/internal/sandbox"
+	"github.com/greenthread-ai/klaudia/internal/subagent"
+	"github.com/greenthread-ai/klaudia/internal/tools"
+)
+
+// relWriteTool stands in for Write. It writes to a fixed name under whatever
+// working directory it is handed, which is the only way a scripted test can
+// write into a checkout whose path is chosen at spawn time. It is named "Write"
+// because the spawner decides on tool names: that is what marks a sub-agent as
+// one that can change the tree.
+type relWriteTool struct {
+	rel   string
+	body  string
+	abs   string   // joined to the parent of the working dir, so a subdir session writes at the checkout root
+	dirs  []string // the working directories it was actually handed
+	paths []string // the files it wrote
+
+	mu *sync.Mutex
+}
+
+// wrote reports the working directories the tool was handed so far. The tool
+// runs on the child's goroutine, and tests poll this from the test goroutine,
+// so the slice is only ever read under the lock. The lock is a pointer because
+// the registry calls the tool's methods by value, which copies the receiver.
+func (w *relWriteTool) wrote() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.dirs...)
+}
+
+func (relWriteTool) Name() string                                { return "Write" }
+func (relWriteTool) Description(context.Context) (string, error) { return "", nil }
+func (relWriteTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{}}`)
+}
+func (relWriteTool) ValidateInput(json.RawMessage) error { return nil }
+func (relWriteTool) PermissionRequest(json.RawMessage) permission.PermissionRequest {
+	return permission.PermissionRequest{}
+}
+func (relWriteTool) CheckPermissions(permission.Context, permission.PermissionRequest) permission.Decision {
+	return permission.Decision{Behavior: permission.Allow}
+}
+func (w *relWriteTool) Execute(_ context.Context, tctx tools.Context, _ json.RawMessage) ([]tools.Result, error) {
+	path := filepath.Join(tctx.WorkingDir, w.rel)
+	if w.abs != "" {
+		path = filepath.Join(tctx.WorkingDir, "..", w.abs)
+	}
+	w.mu.Lock()
+	w.dirs = append(w.dirs, tctx.WorkingDir)
+	w.paths = append(w.paths, path)
+	w.mu.Unlock()
+	if err := os.WriteFile(path, []byte(w.body), 0o644); err != nil {
+		return nil, err
+	}
+	return []tools.Result{{Content: "wrote " + path}}, nil
+}
+
+// gitRepo builds a one-commit repository and points worktree storage at a
+// scratch config dir.
+func gitRepo(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Setenv("KLAUDIA_CONFIG_DIR", t.TempDir())
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "--quiet"},
+		{"config", "user.name", "Test"},
+		{"config", "user.email", "test@example.com"},
+		{"add", "-A"},
+		{"commit", "--quiet", "--allow-empty", "-m", "first"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+	}
+	return root
+}
+
+// errorProvider models a child whose turn fails outright.
+type errorProvider struct{}
+
+func (errorProvider) StreamTurn(_ context.Context, _ anthropic.BetaMessageNewParams, _ api.StreamSink) (anthropic.BetaMessage, error) {
+	return anthropic.BetaMessage{}, errors.New("provider exploded")
+}
+
+// namedStub is a tool that exists only to carry a name past writesFiles.
+type namedStub string
+
+func (n namedStub) Name() string                              { return string(n) }
+func (namedStub) Description(context.Context) (string, error) { return "", nil }
+func (namedStub) InputSchema() json.RawMessage                { return json.RawMessage(`{"type":"object"}`) }
+func (namedStub) ValidateInput(json.RawMessage) error         { return nil }
+func (namedStub) PermissionRequest(json.RawMessage) permission.PermissionRequest {
+	return permission.PermissionRequest{}
+}
+func (namedStub) CheckPermissions(permission.Context, permission.PermissionRequest) permission.Decision {
+	return permission.Decision{Behavior: permission.Allow}
+}
+func (namedStub) Execute(context.Context, tools.Context, json.RawMessage) ([]tools.Result, error) {
+	return []tools.Result{{Content: "ok"}}, nil
+}
+
+func writingSpawner(t *testing.T, w *relWriteTool, dir string) *Spawner {
+	t.Helper()
+	return NewSpawner(&scriptedProvider{turns: []anthropic.BetaMessage{
+		toolUseTurn(t, "tu1", "Write", map[string]any{}),
+	}}, tools.NewRegistry(w), "claude-opus-4-8", bypassPerm(), nil, 2).
+		WithWorkingDir(dir)
+}
+
+// The whole point of the feature: two of these can run at once, so neither may
+// write into the tree the other is reading. The child's tools must therefore be
+// handed a checkout of its own — and the work must still arrive in the user's
+// tree when it finishes, or isolation would just be a way to lose it.
+func TestWritingSubAgentWorksInItsOwnCheckoutAndTheWorkComesBack(t *testing.T) {
+	root := gitRepo(t)
+	w := &relWriteTool{mu: new(sync.Mutex), rel: "made.txt", body: "the child's work\n"}
+
+	text, _, err := writingSpawner(t, w, root).WithWorktrees(true).
+		Spawn(context.Background(), nil, "general-purpose", "write it", nil)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	if len(w.wrote()) != 1 {
+		t.Fatalf("tool ran %d times, want 1", len(w.wrote()))
+	}
+	if w.wrote()[0] == root {
+		t.Fatal("the child wrote straight into the user's tree; nothing was isolated")
+	}
+	if _, err := os.Stat(w.wrote()[0]); err == nil {
+		t.Errorf("the checkout at %s outlived the sub-agent", w.wrote()[0])
+	}
+	body, err := os.ReadFile(filepath.Join(root, "made.txt"))
+	if err != nil {
+		t.Fatalf("the child's work never reached the working tree: %v", err)
+	}
+	if string(body) != "the child's work\n" {
+		t.Errorf("made.txt = %q", body)
+	}
+	// The model asked for files to change; it has to be told that they did.
+	if !strings.Contains(text, "1 file applied to the working tree") {
+		t.Errorf("result does not report what landed:\n%s", text)
+	}
+}
+
+// reportProvider models the normal shape of a writing child: it calls the tool,
+// then reports the path it wrote. The path it has to hand is the checkout's.
+type reportProvider struct {
+	t *testing.T
+	w *relWriteTool
+	n int
+}
+
+func (p *reportProvider) StreamTurn(_ context.Context, _ anthropic.BetaMessageNewParams, sink api.StreamSink) (anthropic.BetaMessage, error) {
+	p.n++
+	if p.n == 1 {
+		return toolUseTurn(p.t, "tu1", "Write", map[string]any{}), nil
+	}
+	text := "wrote " + filepath.Join(p.w.wrote()[0], p.w.rel)
+	if sink.OnText != nil {
+		sink.OnText(text)
+	}
+	return textTurn(p.t, text), nil
+}
+
+// textTurn builds a finished assistant turn. Via JSON because the SDK resolves
+// a content block from its raw fields, which a struct literal leaves empty —
+// the loop would read no text at all.
+func textTurn(t *testing.T, text string) anthropic.BetaMessage {
+	t.Helper()
+	body, _ := json.Marshal(text)
+	raw := fmt.Sprintf(`{"role":"assistant","stop_reason":"end_turn",
+		"content":[{"type":"text","text":%s}]}`, body)
+	var m anthropic.BetaMessage
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatalf("unmarshal text turn: %v", err)
+	}
+	return m
+}
+
+// A path inside the checkout is a path nobody else can open: the parent model
+// would Read it and find nothing, and the user would be told to look somewhere
+// that no longer exists once the checkout is removed. The child's report is
+// translated back to the project on the way out.
+func TestSubAgentResultNamesPathsInTheUsersTree(t *testing.T) {
+	root := gitRepo(t)
+	w := &relWriteTool{mu: new(sync.Mutex), rel: "made.txt", body: "x\n"}
+	s := NewSpawner(&reportProvider{t: t, w: w}, tools.NewRegistry(w), "claude-opus-4-8",
+		bypassPerm(), nil, 3).WithWorkingDir(root).WithWorktrees(true)
+
+	text, _, err := s.Spawn(context.Background(), nil, "general-purpose", "write it", nil)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if checkout := w.wrote()[0]; strings.Contains(text, checkout) {
+		t.Errorf("the child's report cites the checkout, which is gone:\n%s", text)
+	}
+	if want := filepath.Join(root, "made.txt"); !strings.Contains(text, want) {
+		t.Errorf("report does not name %s:\n%s", want, text)
+	}
+}
+
+func TestSubAgentSharesTheTreeWhenItShould(t *testing.T) {
+	tests := []struct {
+		name      string
+		worktrees bool
+		repo      bool
+		canWrite  bool
+	}{
+		{
+			// Explore and Plan read and report paths; a checkout would make
+			// every path they return wrong, and there is nothing to isolate.
+			name:      "a read-only toolset has nothing to isolate",
+			worktrees: true, repo: true, canWrite: false,
+		},
+		{name: "turned off in config", worktrees: false, repo: true, canWrite: true},
+		{
+			// Not every project is a git repository, and that is not a reason
+			// to refuse the work.
+			name: "not a git repository", worktrees: true, repo: false, canWrite: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			if tt.repo {
+				root = gitRepo(t)
+			} else if _, err := exec.LookPath("git"); err != nil {
+				t.Setenv("KLAUDIA_CONFIG_DIR", t.TempDir())
+			}
+
+			w := &relWriteTool{mu: new(sync.Mutex), rel: "made.txt", body: "x\n"}
+			capture := &captureTool{}
+			reg, toolName := tools.NewRegistry(capture), "Capture"
+			if tt.canWrite {
+				reg, toolName = tools.NewRegistry(w), "Write"
+			}
+			s := NewSpawner(&scriptedProvider{turns: []anthropic.BetaMessage{
+				toolUseTurn(t, "tu1", toolName, map[string]any{}),
+			}}, reg, "claude-opus-4-8", bypassPerm(), nil, 2).
+				WithWorkingDir(root).WithWorktrees(tt.worktrees)
+
+			if _, _, err := s.Spawn(context.Background(), nil, "general-purpose", "go", nil); err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			got := capture.got.WorkingDir
+			if tt.canWrite {
+				if len(w.wrote()) != 1 {
+					t.Fatalf("tool ran %d times, want 1", len(w.wrote()))
+				}
+				got = w.wrote()[0]
+			}
+			if got != root {
+				t.Errorf("child ran in %q, want the project root %q", got, root)
+			}
+		})
+	}
+}
+
+// A sub-agent that failed left a checkout in a state nobody has looked at.
+// Applying half of it to the user's tree is the outcome isolation exists to
+// prevent, so the work is kept and the error says where.
+func TestFailedSubAgentKeepsItsCheckoutAndSaysWhere(t *testing.T) {
+	root := gitRepo(t)
+	w := &relWriteTool{mu: new(sync.Mutex), rel: "made.txt", body: "half-finished\n"}
+	s := NewSpawner(&errorProvider{}, tools.NewRegistry(w), "claude-opus-4-8",
+		bypassPerm(), nil, 2).WithWorkingDir(root).WithWorktrees(true)
+
+	_, _, err := s.Spawn(context.Background(), nil, "general-purpose", "go", nil)
+	if err == nil {
+		t.Fatal("expected the provider's error")
+	}
+	if !strings.Contains(err.Error(), "left in") {
+		t.Errorf("error does not say where the changes are: %v", err)
+	}
+	dir := strings.TrimSuffix(err.Error()[strings.LastIndex(err.Error(), "left in ")+len("left in "):], ")")
+	if _, statErr := os.Stat(dir); statErr != nil {
+		t.Errorf("checkout %s was removed with the child's work in it", dir)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "made.txt")); statErr == nil {
+		t.Error("a failed child's work was applied to the user's tree")
+	}
+}
+
+// verify runs against the checkout before adoption. A failing command keeps
+// the checkout, leaves the user's tree untouched, and the output is part of
+// what comes back.
+func TestVerifyFailureBlocksAdoption(t *testing.T) {
+	root := gitRepo(t)
+	w := &relWriteTool{mu: new(sync.Mutex), rel: "made.txt", body: "done\n"}
+	bash, err := tools.NewBash(sandbox.NewLocal())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSpawner(&scriptedProvider{turns: []anthropic.BetaMessage{
+		toolUseTurn(t, "tu1", "Write", map[string]any{}),
+		reply(t, "wrote it"),
+	}}, tools.NewRegistry(w, bash), "claude-opus-4-8", bypassPerm(), nil, 2).
+		WithWorkingDir(root).WithWorktrees(true).WithHooks(userHooks(t)).
+		WithTypes([]subagent.Type{{Name: "Patcher", Tools: []string{"Write", "Bash"}, Verify: "echo verify-broke >&2; exit 1"}})
+
+	text, _, err := s.Spawn(context.Background(), nil, "Patcher", "go", nil)
+	if err == nil || !strings.Contains(err.Error(), "verify failed") {
+		t.Fatalf("verify failure was not reported: %v", err)
+	}
+	if !strings.Contains(text, "verify-broke") {
+		t.Errorf("the command's output was dropped: %q", text)
+	}
+	dir := strings.TrimSuffix(err.Error()[strings.LastIndex(err.Error(), "left in ")+len("left in "):], ")")
+	if _, statErr := os.Stat(filepath.Join(dir, "made.txt")); statErr != nil {
+		t.Errorf("the checkout was removed after a failed verify: %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "made.txt")); statErr == nil {
+		t.Error("a failed verify still adopted the child's work")
+	}
+}
+
+// A verify command that passes does not get in the way: the child's work is
+// adopted and the checkout removed, exactly as if no command were set.
+func TestVerifySuccessAdopts(t *testing.T) {
+	root := gitRepo(t)
+	w := &relWriteTool{mu: new(sync.Mutex), rel: "made.txt", body: "done\n"}
+	bash, err := tools.NewBash(sandbox.NewLocal())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSpawner(&scriptedProvider{turns: []anthropic.BetaMessage{
+		toolUseTurn(t, "tu1", "Write", map[string]any{}),
+		reply(t, "wrote it"),
+	}}, tools.NewRegistry(w, bash), "claude-opus-4-8", bypassPerm(), nil, 2).
+		WithWorkingDir(root).WithWorktrees(true).WithHooks(userHooks(t)).
+		WithTypes([]subagent.Type{{Name: "Patcher", Tools: []string{"Write", "Bash"}, Verify: "test -s made.txt"}})
+
+	if _, _, err := s.Spawn(context.Background(), nil, "Patcher", "go", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "made.txt")); statErr != nil {
+		t.Errorf("a passing verify did not adopt the child's work: %v", statErr)
+	}
+}
+
+// A project that declares its own hooks and has not been approved is not
+// trusted, and its verify command must not run. The child's work stays in
+// the checkout rather than being adopted on the strength of a check that
+// never happened.
+func TestUntrustedProjectDoesNotRunVerify(t *testing.T) {
+	root := gitRepo(t)
+	w := &relWriteTool{mu: new(sync.Mutex), rel: "made.txt", body: "done\n"}
+	ran := &hookProbeTool{}
+	s := NewSpawner(&scriptedProvider{turns: []anthropic.BetaMessage{
+		toolUseTurn(t, "tu1", "Write", map[string]any{}),
+		reply(t, "wrote it"),
+	}}, tools.NewRegistry(w, ran), "claude-opus-4-8", bypassPerm(), nil, 2).
+		WithWorkingDir(root).WithWorktrees(true).
+		WithHooks(hooks.New(root, "sess", nil, []config.Hook{{Event: "PreToolUse", Command: "true"}})).
+		WithTypes([]subagent.Type{{Name: "Patcher", Tools: []string{"Write"}, Verify: "touch verify-ran"}})
+
+	_, _, err := s.Spawn(context.Background(), nil, "Patcher", "go", nil)
+	if err == nil || !strings.Contains(err.Error(), "not approved") {
+		t.Fatalf("an untrusted project's verify was not refused: %v", err)
+	}
+	if ran.calls != 0 {
+		t.Errorf("the verify command ran %d times in an untrusted project", ran.calls)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "made.txt")); statErr == nil {
+		t.Error("an untrusted project's child was adopted without its verify running")
+	}
+}
+
+// The same refusal holds when the verify command comes from the project's own
+// agent file rather than a type built in the test. The file is what an
+// untrusted checkout can actually write, so that is the path that matters.
+func TestUntrustedProjectFileVerifyDoesNotRun(t *testing.T) {
+	root := gitRepo(t)
+	os.MkdirAll(filepath.Join(root, ".klaudia", "agents"), 0o755)
+	os.WriteFile(filepath.Join(root, ".klaudia", "agents", "patcher.md"), []byte(
+		"---\nname: patcher\ndescription: patches\ntools: [Write]\nverify: touch verify-ran\n---\nPatch."), 0o644)
+	loaded := subagent.LoadAll(root, "", nil, []string{"Write"}, nil)
+	found, ok := subagent.Find(loaded, "patcher")
+	if !ok || found.Verify != "touch verify-ran" {
+		t.Fatalf("verify did not load from the file: %+v", found)
+	}
+	w := &relWriteTool{mu: new(sync.Mutex), rel: "made.txt", body: "done\n"}
+	ran := &hookProbeTool{}
+	s := NewSpawner(&scriptedProvider{turns: []anthropic.BetaMessage{
+		toolUseTurn(t, "tu1", "Write", map[string]any{}),
+		reply(t, "wrote it"),
+	}}, tools.NewRegistry(w, ran), "claude-opus-4-8", bypassPerm(), nil, 2).
+		WithWorkingDir(root).WithWorktrees(true).
+		WithHooks(hooks.New(root, "sess", nil, []config.Hook{{Event: "PreToolUse", Command: "true"}})).
+		WithTypes(loaded)
+
+	_, _, err := s.Spawn(context.Background(), nil, "patcher", "go", nil)
+	if err == nil || !strings.Contains(err.Error(), "not approved") {
+		t.Fatalf("a verify loaded from an untrusted project file was not refused: %v", err)
+	}
+	if ran.calls != 0 {
+		t.Errorf("the file's verify command ran %d times", ran.calls)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "made.txt")); statErr == nil {
+		t.Error("the child's work was adopted though its verify never ran")
+	}
+}
+
+func TestWritesFiles(t *testing.T) {
+	tests := []struct {
+		name  string
+		tools []string
+		want  bool
+	}{
+		{name: "the read-only three", tools: []string{"Read", "Glob", "Grep"}, want: false},
+		{name: "Write", tools: []string{"Read", "Write"}, want: true},
+		{name: "Edit", tools: []string{"Edit"}, want: true},
+		{name: "NotebookEdit", tools: []string{"NotebookEdit"}, want: true},
+		{name: "Bash can write anything", tools: []string{"Read", "Bash"}, want: true},
+		{name: "nothing at all", tools: nil, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var ts []tools.Tool
+			for _, n := range tt.tools {
+				ts = append(ts, namedStub(n))
+			}
+			if got := writesFiles(tools.NewRegistry(ts...)); got != tt.want {
+				t.Errorf("writesFiles(%v) = %v, want %v", tt.tools, got, tt.want)
+			}
+		})
+	}
+}
+
+// requestedDirSpec is the test double for the Agent tool's working_dir input:
+// the launching turn's state plus the requested directory childSpecFrom reads.
+type requestedDirSpec struct {
+	workingDir string
+	extraDirs  []string
+	dir        string
+}
+
+func (s requestedDirSpec) ParentApprover() any                      { return nil }
+func (s requestedDirSpec) ParentMode() func() permission.Mode       { return nil }
+func (s requestedDirSpec) ParentModel() string                      { return "" }
+func (s requestedDirSpec) ParentEffort() string                     { return "" }
+func (s requestedDirSpec) ParentThinking() string                   { return "" }
+func (s requestedDirSpec) ParentBeforeEdit() func(string, []string) { return nil }
+func (s requestedDirSpec) ParentExtraDirs() []string                { return s.extraDirs }
+func (s requestedDirSpec) ParentBudget() *float64                   { return nil }
+func (s requestedDirSpec) ParentWorkingDir() string                 { return s.workingDir }
+func (s requestedDirSpec) ParentConversation() string               { return "" }
+func (s requestedDirSpec) RequestedWorkingDir() string              { return s.dir }
+
+// A working_dir inside an additional directory is resolved to that repository's
+// toplevel, and both the seed and the adoption happen there rather than in the
+// session's repository. The launch result names the repo, branch and HEAD.
+func TestWorkingDirInsideExtraDirSeedsFromThatRepo(t *testing.T) {
+	rootA := gitRepo(t)
+	rootB := gitRepo(t)
+	nested := filepath.Join(rootB, "sub")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := &relWriteTool{mu: new(sync.Mutex), rel: "made.txt", body: "from B\n"}
+
+	text, _, err := writingSpawner(t, w, rootA).WithWorktrees(true).
+		Spawn(context.Background(), requestedDirSpec{
+			workingDir: rootA, extraDirs: []string{rootB}, dir: nested,
+		}, "general-purpose", "write it", nil)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	if len(w.wrote()) != 1 || w.wrote()[0] == rootA {
+		t.Fatalf("child wrote %v, want a checkout of %s", w.wrote(), rootB)
+	}
+	body, err := os.ReadFile(filepath.Join(rootB, "made.txt"))
+	if err != nil {
+		t.Fatalf("the child's work never reached repo B: %v", err)
+	}
+	if string(body) != "from B\n" {
+		t.Errorf("made.txt in B = %q", body)
+	}
+	if _, err := os.Stat(filepath.Join(rootA, "made.txt")); err == nil {
+		t.Error("repo A received the child's file")
+	}
+	head := gitOut(rootB, "rev-parse", "--short", "HEAD")
+	for _, want := range []string{"Cut from " + rootB, "on master", "at " + head} {
+		if !strings.Contains(text, want) {
+			t.Errorf("launch result missing %q:\n%s", want, text)
+		}
+	}
+}
+
+// A working_dir outside the session's directory and its additional directories
+// is refused before anything is cut, and the refusal says why.
+func TestWorkingDirOutsideSessionIsRefused(t *testing.T) {
+	rootA := gitRepo(t)
+	elsewhere := gitRepo(t)
+	w := &relWriteTool{mu: new(sync.Mutex), rel: "made.txt", body: "nope\n"}
+
+	_, _, err := writingSpawner(t, w, rootA).WithWorktrees(true).
+		Spawn(context.Background(), requestedDirSpec{
+			workingDir: rootA, dir: elsewhere,
+		}, "general-purpose", "write it", nil)
+	if err == nil {
+		t.Fatal("a working_dir outside the session was accepted")
+	}
+	if !strings.Contains(err.Error(), "outside") {
+		t.Errorf("error does not say the directory is outside the session: %v", err)
+	}
+	if len(w.wrote()) != 0 {
+		t.Errorf("the child ran anyway: %v", w.wrote())
+	}
+}
+
+// A session rooted in a subdirectory of its repository still adopts an edit the
+// child made outside that subdirectory. Before the fix the patch was applied
+// from the subdirectory, so the edit was listed and then discarded.
+func TestSubdirSessionAdoptsEditsOutsideIt(t *testing.T) {
+	root := gitRepo(t)
+	if err := os.MkdirAll(filepath.Join(root, "svc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(root, "top.txt"), []byte("top\n"), 0o644)
+	os.WriteFile(filepath.Join(root, "svc", "keep.txt"), []byte("k\n"), 0o644)
+	gitCommitAll(t, root)
+
+	w := &relWriteTool{mu: new(sync.Mutex), abs: "top.txt", body: "changed at the top\n"}
+	s := writingSpawner(t, w, filepath.Join(root, "svc")).WithWorktrees(true)
+	if _, _, err := s.Spawn(context.Background(), nil, "general-purpose", "write it", nil); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	wrote := w.wrote()
+	if len(wrote) != 1 {
+		t.Fatalf("wrote %v", wrote)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "top.txt")); err != nil || string(got) != "changed at the top\n" {
+		t.Fatalf("the edit outside the session subdirectory was not adopted (child wrote %v): %v, got %q", w.paths, err, got)
+	}
+}
+
+func gitCommitAll(t *testing.T, dir string) {
+	t.Helper()
+	for _, args := range [][]string{{"add", "-A"}, {"commit", "--quiet", "-m", "more"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		// Inherit the environment so GIT_DIR and GIT_WORK_TREE, which the
+		// hermetic test harness exports, still point at this repository. A
+		// minimal env that drops them lets `git add -A` invent a nested
+		// repository in a subdirectory it is about to commit.
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e.invalid",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e.invalid")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+}
+
+// A child that shares the tree, in a session rooted in a subdirectory, writes
+// relative to that subdirectory and not to the repository toplevel.
+func TestSharedChildInSubdirWritesThere(t *testing.T) {
+	root := gitRepo(t)
+	sub := filepath.Join(root, "svc")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := &relWriteTool{mu: new(sync.Mutex), rel: "here.txt", body: "in svc\n"}
+	s := writingSpawner(t, w, sub) // worktrees off: the child shares the tree
+	if _, _, err := s.Spawn(context.Background(), nil, "general-purpose", "write it", nil); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sub, "here.txt")); err != nil {
+		t.Errorf("the write did not land in the session subdirectory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "here.txt")); err == nil {
+		t.Error("the write landed at the repository toplevel")
+	}
+}
+
+// A working_dir in a linked worktree of the session's repository — a sibling
+// directory, not under the session's — is the same repository, so a writer can
+// be launched there: it is cut from that worktree and adopted back into it.
+func TestWorkingDirInLinkedWorktreeIsAllowed(t *testing.T) {
+	rootA := gitRepo(t)
+	wt := filepath.Join(t.TempDir(), "sibling")
+	if out, err := exec.Command("git", "-C", rootA, "worktree", "add", "-q", "-b", "sibling", wt).CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v\n%s", err, out)
+	}
+	w := &relWriteTool{mu: new(sync.Mutex), rel: "made.txt", body: "in the sibling\n"}
+
+	text, _, err := writingSpawner(t, w, rootA).WithWorktrees(true).
+		Spawn(context.Background(), requestedDirSpec{
+			workingDir: rootA, dir: wt,
+		}, "general-purpose", "write it", nil)
+	if err != nil {
+		t.Fatalf("Spawn into a linked worktree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "made.txt")); err != nil {
+		t.Fatalf("the child's work never reached the linked worktree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootA, "made.txt")); err == nil {
+		t.Error("the main checkout received the child's file")
+	}
+	if !strings.Contains(text, "Cut from "+canonical(wt)) || !strings.Contains(text, "on sibling") {
+		t.Errorf("launch result does not name the worktree it was cut from:\n%s", text)
+	}
+}
+
+// A directory that only points into the session's repository — a .git file
+// naming a worktree's admin area — is not a registered worktree and stays
+// refused.
+func TestWorkingDirPointingIntoRepoIsRefused(t *testing.T) {
+	rootA := gitRepo(t)
+	wt := filepath.Join(t.TempDir(), "real")
+	if out, err := exec.Command("git", "-C", rootA, "worktree", "add", "-q", "-b", "real", wt).CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v\n%s", err, out)
+	}
+	gitFile, err := os.ReadFile(filepath.Join(wt, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	impostor := t.TempDir()
+	if err := os.WriteFile(filepath.Join(impostor, ".git"), gitFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w := &relWriteTool{mu: new(sync.Mutex), rel: "made.txt", body: "nope\n"}
+	_, _, err = writingSpawner(t, w, rootA).WithWorktrees(true).
+		Spawn(context.Background(), requestedDirSpec{workingDir: rootA, dir: impostor}, "general-purpose", "write it", nil)
+	if err == nil || !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("a directory pointing into the repository was accepted: %v", err)
+	}
+	if len(w.wrote()) != 0 {
+		t.Errorf("the child ran anyway: %v", w.wrote())
+	}
+}

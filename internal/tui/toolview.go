@@ -4,8 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/charmbracelet/x/ansi"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 
@@ -27,7 +31,8 @@ const (
 var summaryKey = map[string]string{
 	"Bash": "command", "BashOutput": "bash_id", "KillShell": "shell_id",
 	"Read": "file_path", "Write": "file_path", "Edit": "file_path", "NotebookEdit": "notebook_path",
-	"Diagnostics": "file", "Definition": "file", "References": "file",
+	"Diagnostics": "file", "Definition": "file", "References": "file", "WorkspaceSymbol": "query",
+	"Implementation": "file", "Hover": "file", "DocumentSymbols": "file", "Rename": "file",
 	"Glob": "pattern", "Grep": "pattern",
 	"BrowserSearch": "query", "BrowserFetch": "url", "BrowserNavigate": "url",
 	"Skill": "name", "ToolSearch": "query",
@@ -73,11 +78,55 @@ func toolSummary(name string, input any) string {
 		}
 	}
 	if key, ok := summaryKey[name]; ok {
-		if v := oneline(f[key], maxSummary); v != "" {
+		if v := oneline(relToCwd(f[key]), maxSummary); v != "" {
 			return " " + v
 		}
 	}
 	return ""
+}
+
+// visible renders s for an approval: nothing is cut and nothing is hidden.
+// Control characters (a raw ESC or CR can redraw the terminal), format
+// characters (zero-width, bidi overrides, tag characters) and look-alike
+// spaces are shown as \u{XXXX} escapes, and tabs as \t, so what the user
+// approves is what will run. Newlines are kept, and continuation lines are
+// indented to sit under the first.
+//
+// oneline is not safe here: it cut commands at 220 runes, so a dangerous tail
+// could be padded out of view, and it passed invisible characters through.
+func visible(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r == '\n':
+			b.WriteString("\n    ")
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r == ' ':
+			b.WriteRune(r)
+		case unicode.IsControl(r), unicode.Is(unicode.Cf, r), unicode.IsSpace(r),
+			unicode.Is(unicode.Zl, r), unicode.Is(unicode.Zp, r), r == utf8.RuneError:
+			fmt.Fprintf(&b, `\u{%04X}`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// relToCwd shortens absolute paths under the working directory to relative ones in a tool
+// header, so "⚙ Read /long/session/dir/src/a.go" reads "⚙ Read src/a.go" and the host's
+// directory layout never reaches the screen. Other text is unchanged.
+func relToCwd(s string) string {
+	wd, err := os.Getwd()
+	if err != nil || wd == "" || wd == "/" {
+		return s
+	}
+	s = strings.ReplaceAll(s, wd+string(filepath.Separator), "")
+	if s == wd {
+		return "."
+	}
+	return s
 }
 
 // oneline collapses whitespace/newlines and truncates to n runes.
@@ -157,27 +206,23 @@ func shortMode(m permission.Mode) string {
 		// be wrong.
 		return "autonomous"
 	case permission.ModeAcceptEdits:
-		return "auto-edit"
+		return "accept edits"
 	case permission.ModeBypassPermissions:
 		return "bypass"
 	case permission.ModePlan:
 		return "plan"
-	case permission.ModeDontAsk:
-		return "deny"
 	default:
-		return "ask"
+		return string(m)
 	}
 }
 
 // deviatingMode returns the mode label to show, or "" when the session is
 // simply working normally.
 //
-// Both defaults are silent: autonomous for a current config, and ask for one
-// written before the mode collapse. Each is the steady state for whoever is
-// running it, and neither tells them anything they do not already assume.
+// Autonomous is silent: it is the steady state, and saying so on every line
+// would tell the user nothing they do not already assume.
 func deviatingMode(m permission.Mode) string {
-	switch m {
-	case permission.ModeAutonomous, permission.ModeDefault:
+	if m == permission.ModeAutonomous {
 		return ""
 	}
 	return shortMode(m)
@@ -269,7 +314,12 @@ func (m *Model) statusLine() string {
 	}
 	segments = append(segments,
 		hintStyle.Render(fmt.Sprintf("%d turns", m.statTurns)),
-		hintStyle.Render(fmt.Sprintf("%s tokens", humanTokens(m.statIn+m.statOut))))
+		hintStyle.Render(fmt.Sprintf("%s in+out", humanTokens(m.statIn+m.statOut))))
+	// Running cost, when the model has a known price. Lowest priority (appended
+	// last) so fitSegments drops it first on a narrow terminal.
+	if seg := m.costSegment(); seg != "" {
+		segments = append(segments, hintStyle.Render(seg))
+	}
 
 	// width-3: two columns for the caption indent, and one for the reserved
 	// last column the live region never writes to (see promptBox).

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/stopwatch"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -25,35 +27,49 @@ import (
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"golang.org/x/term"
 
 	"github.com/greenthread-ai/klaudia/internal/agent"
 	"github.com/greenthread-ai/klaudia/internal/api"
 	"github.com/greenthread-ai/klaudia/internal/compaction"
-	"github.com/greenthread-ai/klaudia/internal/config"
+	"github.com/greenthread-ai/klaudia/internal/gitguard"
+	"github.com/greenthread-ai/klaudia/internal/gitprobe"
 	"github.com/greenthread-ai/klaudia/internal/goal"
+	"github.com/greenthread-ai/klaudia/internal/mcp"
 	"github.com/greenthread-ai/klaudia/internal/memory"
 	"github.com/greenthread-ai/klaudia/internal/permission"
 	"github.com/greenthread-ai/klaudia/internal/sandbox"
 	"github.com/greenthread-ai/klaudia/internal/tools"
+	"github.com/greenthread-ai/klaudia/internal/version"
 )
 
-// RunFunc drives one user turn against the agent core, threading conversation
-// history and using the supplied approver, asker, and emitter.
-type RunFunc func(ctx context.Context, prompt string, history []anthropic.BetaMessageParam, approver agent.Approver, asker tools.Asker, planner tools.Planner, emit agent.Emitter, interject func() agent.Interjection, beforeEdit func(string, []string)) (agent.Result, error)
+// RunFunc drives one user turn against the agent core. It is the shared
+// frontend contract — see agent.Turn for why the per-turn arguments are a struct
+// rather than the nine positional parameters this alias replaced.
+type RunFunc = agent.RunFunc
 
 // Session is mutable state shared between the TUI and the RunFunc closure, so
 // slash commands like /model can change settings for subsequent turns. The
 // RunFunc should read these fields fresh on each call.
 type Session struct {
-	SessionID      string         // transcript/session id used by --resume
-	Model          string         // model alias or full ID ("" = default)
-	ResolvedModel  string         // concrete model id for display
-	PermissionMode string         // live mode (ExitPlanMode flips it out of "plan")
-	Memory         memory.Store   // backs /memory; never nil — set to memory.Disabled() when unavailable
-	Goal           string         // standing goal re-injected each turn (Ralph-style)
-	Theme          string         // markdown render theme ("" = dark)
-	EnterInserts   bool           // Return inserts a newline; alt+Return/ctrl+j submit
-	Skills         []SkillCommand // user-defined skills dispatched as /<name>
+	SessionID      string       // transcript/session id used by --resume
+	Model          string       // model alias or full ID ("" = default)
+	ResolvedModel  string       // concrete model id for display
+	Effort         string       // reasoning effort ("" = the model's default); /effort changes it
+	PermissionMode string       // live mode (ExitPlanMode flips it out of "plan")
+	Memory         memory.Store // backs /memory; never nil — set to memory.Disabled() when unavailable
+	Goal           string       // standing goal re-injected each turn (Ralph-style); restored on resume
+	// InitialPrompt is submitted as the first user message once the TUI is up
+	// (--prompt-interactive): typed-input semantics — slash commands, @files —
+	// and the session stays open afterwards. "" sends nothing.
+	InitialPrompt string
+	Theme         string         // markdown render theme ("" = dark)
+	EnterInserts  bool           // Return inserts a newline; alt+Return/ctrl+j submit
+	Notify        NotifyModes    // terminal-attention mechanisms (bell/OSC9/OSC777)
+	NoTagline     bool           // [banner] tagline = "off": no rotating subtitle after the logo
+	CursorBlink   bool           // [tui] cursor = "blink" / KLAUDIA_CURSOR_BLINK: blink the input cursor (default steady; see idle.go)
+	NoTitle       bool           // [tui] title = "off": never set the terminal title (see idle.go)
+	Skills        []SkillCommand // user-defined skills dispatched as /<name>
 
 	// Render-only context for /config and /context (set once at startup).
 	Provider    string      // resolved provider ("anthropic" | "openai" | …)
@@ -68,9 +84,33 @@ type Session struct {
 	ContextWindow       int
 	ContextWindowSource string
 
+	// SaveGoal, if set, records the standing goal ("" clears it) so a resume
+	// of this session restores it. Called whenever /goal sets or clears it.
+	SaveGoal func(string) error
+
+	// PromptHistory, if set, keeps ↑ history across sessions in this project.
+	// Nil keeps it for this session only.
+	PromptHistory PromptHistoryStore
+
 	// Compact, if set, runs a model-based compaction of the given history and
-	// returns the replacement history plus the summary. Backs /compact.
+	// returns the replacement history plus the summary. The focus is optional
+	// free text the user typed after /compact; it is empty for a plain /compact.
+	// Backs /compact.
 	Compact CompactFunc
+	// Rewind, if set, drops the last n message entries from the persisted
+	// transcript so a resume matches the rewound in-memory history. Backs the
+	// transcript half of /rewind. Nil when there is no transcript (e.g. a
+	// transcript-open failure at startup), in which case /rewind still edits the
+	// in-memory conversation.
+	Rewind func(dropMessages int) error
+	// ReadSummary, if set, returns the current/last persisted compaction summary
+	// for this session and whether one exists. Backs /summary. Nil when no
+	// summary store is wired (e.g. tests), which /summary reports rather than
+	// pretending there is nothing to show.
+	ReadSummary func() (summary string, ok bool)
+	// SaveSummary, if set, persists an edited compaction summary, replacing the
+	// stored one. Backs /summary edit. Nil disables editing.
+	SaveSummary func(summary string) error
 	// Doctor, if set, returns a rendered environment diagnostic. Backs /doctor.
 	Doctor func() string
 	// ListModels, if set, enumerates the models the configured provider serves,
@@ -95,6 +135,21 @@ type Session struct {
 	// and what the classifier has found. Nil when there is no gate, which
 	// /trust reports rather than hiding.
 	Trust TrustController
+	// Rotate, if set, ends the session being recorded and starts a new one,
+	// returning the new id and the one it ended ("" when that recorded
+	// nothing). Backs /clear, so a cleared conversation stays behind as its own
+	// session instead of being auto-resumed. Nil only clears memory.
+	Rotate func() (newID, prevID string)
+	// BackgroundAgents, if set, backs the second half of /agents: the background
+	// sub-agents this session has launched and their live status. Nil when the
+	// spawner is not wired for background agents, in which case /agents shows the
+	// available types only.
+	BackgroundAgents BackgroundAgentLister
+	// Resume, if set, backs the /resume picker: it switches the live transcript
+	// recorder to the session with the given id and returns that session's
+	// reconstructed history for the TUI to load. Nil when resume isn't wired
+	// (e.g. no transcript), in which case /resume says so rather than pretending.
+	Resume func(id string) ([]anthropic.BetaMessageParam, error)
 }
 
 // MCPController lets the TUI manage MCP servers without owning the manager.
@@ -109,29 +164,19 @@ type MCPServerInfo struct {
 	Name      string
 	Connected bool
 	Tools     int
+	// ListErr is why a connected server's tool list could not be read.
+	ListErr string
 }
 
-// MCPReloadEvent reports the outcome of one hot reload of the MCP config.
-//
-// Only failures travel: a reload that works is meant to be invisible, and
-// announcing every successful one would punish the config file for being
-// edited.
-type MCPReloadEvent struct {
-	// ConfigErr is set when the config could not be read or parsed. Nothing
-	// was applied in that case and the servers already running are untouched,
-	// which is worth saying — the edit looks live but is not.
-	ConfigErr string
-	// ServerErrs are the per-server launch failures from an otherwise applied
-	// reload, already formatted.
-	ServerErrs []string
-}
-
-// Failed reports whether anything in the reload went wrong.
-func (e MCPReloadEvent) Failed() bool { return e.ConfigErr != "" || len(e.ServerErrs) > 0 }
+// MCPReloadEvent reports the outcome of one hot reload of the MCP config. It
+// lives in internal/mcp now — every frontend gets these, not just this one.
+type MCPReloadEvent = mcp.ReloadEvent
 
 // CompactFunc summarizes the conversation history via the model, returning the
-// replacement history and the summary text.
-type CompactFunc func(ctx context.Context, history []anthropic.BetaMessageParam) (newHistory []anthropic.BetaMessageParam, summary string, err error)
+// replacement history and the summary text. A non-empty focus is threaded into
+// the summary request so it emphasizes what the user named; an empty focus is
+// the default compaction.
+type CompactFunc func(ctx context.Context, history []anthropic.BetaMessageParam, focus string) (newHistory []anthropic.BetaMessageParam, summary string, err error)
 
 // AgentInfo is the model-facing summary of a sub-agent type, shown by /agents.
 type AgentInfo struct {
@@ -184,6 +229,10 @@ type (
 	permissionMsg struct {
 		req   agent.ApprovalRequest
 		reply chan permission.Decision
+		// ctx is the asker's context. A queued ask whose child was cancelled
+		// before it reached the screen has nothing waiting on reply, so it is
+		// dropped rather than shown.
+		ctx context.Context
 	}
 )
 
@@ -203,10 +252,22 @@ type compactDoneMsg struct {
 	summary string
 	err     error
 }
+
+// queuedAsk is one prompt waiting its turn: either a permission ask or a
+// question. Both used to have their own field, so a question arriving while a
+// permission was on screen replaced it and stranded the permission's reply
+// channel. One queue means whichever is showing finishes before the next is
+// drawn, and a queued ask whose context is already cancelled is never drawn.
+type queuedAsk struct {
+	permission *permissionMsg
+	ask        *askMsg
+}
+
 type askMsg struct {
 	question string
 	options  []tools.AskOption
 	reply    chan string
+	ctx      context.Context
 }
 type planMsg struct {
 	plan  string
@@ -240,7 +301,12 @@ var (
 	hintStyle     = baseStyle().Faint(true).Italic(true)
 	// warnStyle marks the one status segment that must not read as ordinary
 	// chrome: a mode where nothing is being checked.
-	warnStyle    = baseStyle().Bold(true).Foreground(lipgloss.Color("9"))
+	warnStyle = baseStyle().Bold(true).Foreground(lipgloss.Color("9"))
+	// noticeStyle marks a system notice about something that went wrong
+	// invisibly — a dropped web search leaves no other trace in the
+	// transcript, which is what made it a bug. Deliberately not bannerStyle:
+	// faint is for things the user may ignore.
+	noticeStyle  = baseStyle().Foreground(lipgloss.Color("3"))
 	suggestStyle = baseStyle()
 )
 
@@ -290,15 +356,25 @@ func skillNames(sess *Session) []string {
 // introSkillsShown caps the names listed before the line becomes noise.
 const introSkillsShown = 4
 
-func intro(model, branch, tagline string, skills []string) string {
+// build is the short build name (version.Info.Short) — a commit, "+dirty"
+// when the tree was, or a release — so a screenshot or a pasted session says
+// which binary produced it. Empty leaves it out.
+func intro(model, branch, tagline, build string, skills []string) string {
 	logo := logoStyle.Render("✦ Klaudia")
-	tag := bannerStyle.Render(" " + tagline)
-	var meta string
-	if model != "" {
-		meta = "\n" + bannerStyle.Render("  model: "+model)
+	tag := ""
+	if tagline != "" {
+		tag = bannerStyle.Render(" " + tagline)
 	}
-	if branch != "" {
-		meta += bannerStyle.Render("   ⎇ " + branch)
+	var meta string
+	for _, part := range []string{"model: " + model, "⎇ " + branch, "build " + build} {
+		if strings.HasSuffix(part, " ") { // that fact is unknown
+			continue
+		}
+		if meta == "" {
+			meta = "\n" + bannerStyle.Render("  "+part)
+		} else {
+			meta += bannerStyle.Render("   " + part)
+		}
 	}
 	// Skills were the thing nobody could tell was working: with none loaded
 	// there is no Skill tool to ask about, and with some loaded the only
@@ -336,11 +412,28 @@ type Model struct {
 	history    []anthropic.BetaMessageParam
 	pending    chan permission.Decision
 	pendingReq agent.ApprovalRequest
-	// hostRedirect marks the pending answer as "no, do it differently" rather
-	// than a plain refusal, so the echoed line invites the instruction the user
-	// is about to type instead of announcing that Klaudia will carry on without
-	// it. Cleared as it is read.
-	hostRedirect bool
+	// askQueue holds asks that arrived while one was already on screen. A
+	// second child asking at the same time used to overwrite the one on
+	// screen, and the first child's goroutine then blocked forever on a
+	// reply nobody could send. Permission asks and questions share one
+	// queue so neither can hide the other. Answered in order.
+	askQueue []queuedAsk
+	// stateBeforeAsk is the state to return to once the last ask is
+	// answered. A background child can ask while the TUI is idle, and
+	// answering must not pretend a turn is running. It starts at running
+	// because an ask almost always interrupts a turn, and a caller that
+	// sets the awaiting state directly has not recorded one.
+	stateBeforeAsk uiState
+	// knownModels is the model list the provider last reported to /model,
+	// kept so /model <id> can warn about an id the endpoint does not list and
+	// Tab can complete it, without a second lookup. Nil until the list has been
+	// fetched once.
+	knownModels []api.ModelInfo
+	// redirect marks the pending answer as "no, do it differently" rather than
+	// a plain refusal, so the echoed line invites the instruction the user is
+	// about to type instead of announcing that Klaudia will carry on without
+	// it. Any permission prompt can be answered this way. Cleared as it is read.
+	redirect bool
 	// following is the job whose log is being tailed into scrollback, or "".
 	// Follow prints into the terminal's own scrollback rather than a managed
 	// region, which is why scrolling up during follow cannot be snapped back
@@ -350,6 +443,11 @@ type Model struct {
 	// so they survive compaction, which is the only way "keep this in mind"
 	// still means something forty turns later.
 	pinned []string
+	// lastSummary is the most recent compaction summary produced this session,
+	// kept so /summary can show it without a disk read. Empty until the first
+	// /compact (or autocompact) of the session; /summary falls back to the
+	// persisted summary when this is empty.
+	lastSummary string
 	// checkpoints is the undo stack: the contents of files, as git blobs, from
 	// just before Klaudia changed them.
 	checkpoints checkpointStack
@@ -399,10 +497,6 @@ type Model struct {
 	// session, so /commit can stage its own work and leave the user's alone.
 	touched map[string]bool
 	sess    *Session
-	// Session-scoped allow/deny rules added via "allow always" or /allow,/deny.
-	// Accessed only from the UI goroutine (Update) to avoid races.
-	sessionAllow []permission.Rule
-	sessionDeny  []permission.Rule
 	// Goal/loop state (the "/goal" feature). goalSetting frames turns as
 	// spec-authoring. loopRemaining>0 means the "/goal run" Ralph loop is active:
 	// each finished iteration starts the next (via the doneMsg hook) until the
@@ -416,6 +510,13 @@ type Model struct {
 	loopVerifying  bool   // the next loop turn is the final-review verification
 	loopBranch     string // the goal branch the loop's work lands on
 	loopBaseBranch string // the branch the loop started from (merge target)
+	// loopGuard refuses tool calls that would discard uncommitted work that
+	// predates the loop (gitguard); applied to loop turns only.
+	loopGuard func(tool string, input []byte, cwd string) string
+	// loopMode is the run's git model (no-branch / no-commit, #246).
+	loopMode goal.RunMode
+	// initialPromptSent records that Session.InitialPrompt went out.
+	initialPromptSent bool
 	// quitArmed is set by a Ctrl+C press that had nothing left to cancel (see
 	// onCtrlC). While armed the status bar says so, and an immediately repeated
 	// Ctrl+C quits; any other key disarms it. This is what stops a reflexive
@@ -435,6 +536,16 @@ type Model struct {
 	statTurns int
 	statIn    int64
 	statOut   int64
+	// statChildCost is sub-agent spend in USD, priced against the children's
+	// own models. Their tokens are not in statIn/statOut.
+	statChildCost float64
+	// Cumulative cache tokens for the session, tracked separately from statIn/
+	// statOut because cost prices them at different rates. Live "usage" events
+	// carry no cache deltas, so these are updated only at doneMsg from the
+	// authoritative Result — the status-bar cost is therefore exact at each turn
+	// end and slightly under mid-turn (cache reads not yet counted).
+	statCacheRead  int64
+	statCacheWrite int64
 	// Per-turn tally of what we already counted via live "usage" events. Reset
 	// at startTurn and subtracted from the final Result at doneMsg so a dropped
 	// usage event still settles correctly without double-counting.
@@ -470,6 +581,30 @@ type Model struct {
 	// pendingOSC holds a clipboard escape sequence to emit on the next frame.
 	// Writing it through View keeps it ordered with respect to the renderer.
 	pendingOSC string
+	// termReply swallows terminal query replies that arrive as keys (termreply.go).
+	termReply termReplyFilter
+	// pendingNotify holds attention escapes (bell/OSC 9/OSC 777) to emit on the
+	// next frame, queued when Klaudia needs the user (a turn finished, a prompt
+	// is waiting). Emitted through View for the same ordering reason as
+	// pendingOSC, but kept separate so a queued /copy and a notification in the
+	// same frame don't clobber each other.
+	pendingNotify string
+	// title is the state title last sent to the terminal (idle.go), so it is
+	// sent again only on a transition; titleOut is where it is written — the
+	// program's output, or nil to keep it to the model.
+	title    string
+	titleOut io.Writer
+	// spinning is true while the spinner's tick loop is armed. It runs only
+	// while the running state shows it (idle.go), so an idle prompt has no
+	// timer at all.
+	spinning bool
+	// focused tracks terminal focus when the terminal reports it (DECSET 1004,
+	// enabled by tea.WithReportFocus). focusKnown is false until the first
+	// focus/blur event proves the terminal supports it; while it is false the
+	// notifier fires regardless, so a terminal that never reports focus still
+	// gets notified rather than silently never.
+	focused    bool
+	focusKnown bool
 	// steer holds what the user typed while Klaudia was working. The agent loop
 	// drains it at its next safe point, so a correction lands before the next
 	// consequential action rather than after the turn. Anything still pending
@@ -489,14 +624,24 @@ type Model struct {
 	planReply chan bool
 	// Pending /commit-style confirmation: run on "y", returns a result line.
 	confirmAction func() string
+	// choiceNav is the open picker's filter, highlight and scroll (picker.go).
+	choiceNav choiceNav
+
 	// Pending local settings picker (e.g. /mode): numbered choices.
+	// choiceReturn is the state the picker hands back to when it closes:
+	// stateRunning when it was opened over a turn that is still in flight.
 	choiceItems  []choiceItem
 	choicePrompt string
+	choiceReturn uiState
 	// Input history: submitted prompts (newest last), navigated with Up/Down.
 	// histPos == len(inputHistory) means "not navigating" (editing a fresh line).
 	inputHistory []string
 	histPos      int
 	histDraft    string // the in-progress line stashed when navigating up
+	// search is the open Ctrl+R history search, if any (see history.go).
+	search historySearch
+	// historyFaulted is set once a history-file failure has been reported.
+	historyFaulted bool
 	// Verbatim payloads for pastes shown in the input as chips (see paste.go).
 	// Session-scoped, because history recall re-shows a chip.
 	pastes pasteStore
@@ -509,6 +654,10 @@ type Model struct {
 	// Elapsed-run stopwatch and per-turn cancel (Esc interrupts the model).
 	sw         stopwatch.Model
 	turnCancel context.CancelFunc
+	// turnInFlight is true from startTurn until that turn's doneMsg. Unlike
+	// turnCancel it survives an interrupt, which clears turnCancel while the
+	// cancelled goroutine is still winding down.
+	turnInFlight bool
 	// streamBuf holds the not-yet-printed part of the in-progress assistant
 	// message; scan tracks how much of it is safe to commit to scrollback, and
 	// chunked records whether this message has already flushed a chunk (so the
@@ -533,6 +682,9 @@ func New(ctx context.Context, run RunFunc, history []anthropic.BetaMessageParam,
 	}
 	in := newPromptInput()
 	in.KeyMap.InsertNewline = newlineBinding(sess.EnterInserts)
+	if sess.CursorBlink {
+		in.Cursor.SetMode(cursor.CursorBlink)
+	}
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
@@ -547,6 +699,7 @@ func New(ctx context.Context, run RunFunc, history []anthropic.BetaMessageParam,
 		state:   stateIdle,
 		history: history,
 		sess:    sess,
+		focused: true, // assume focused until the terminal says otherwise
 	}
 	m.executor = sess.Executor
 	// Capture the working tree before Klaudia touches anything. A file that is
@@ -554,7 +707,7 @@ func New(ctx context.Context, run RunFunc, history []anthropic.BetaMessageParam,
 	// apart.
 	m.base = newBaseline()
 	if sess.CWD != "" {
-		if status, err := gitOutput(sess.CWD, "status", "--porcelain"); err == nil {
+		if status, err := gitProbe(sess.CWD, "status", "--porcelain"); err == nil {
 			m.base.capture(status)
 		}
 	}
@@ -590,8 +743,14 @@ func New(ctx context.Context, run RunFunc, history []anthropic.BetaMessageParam,
 	}
 	m.introModel, m.introBranch = model, branch
 	m.introTagline, m.hasIntro = randomTagline(), true
+	if sess != nil && sess.NoTagline {
+		m.introTagline = ""
+	}
 	m.appendLine(m.introText())
-	// A resumed session gets the operational picture instead of the
+	// A resumed session shows where the conversation was (recap.go)...
+	m.appendResumeRecap(history)
+	m.loadInputHistory(history)
+	// ...and gets the operational picture instead of the
 	// dirty-tree note: it subsumes it, and adds what did not survive.
 	if st := m.buildResumeState(); len(history) > 0 && st.hasContent() {
 		m.appendLine(bannerStyle.Render(st.render()))
@@ -692,7 +851,7 @@ func (m *Model) answerAsk(answer string) {
 		m.askReply = nil
 	}
 	m.appendLine(toolStyle.Render("  → " + answer))
-	m.setState(stateRunning)
+	m.showNextAsk()
 }
 
 // beginOtherAnswer switches from the numbered list to free-text entry, seeding
@@ -706,7 +865,7 @@ func (m *Model) beginOtherAnswer(seed string) tea.Cmd {
 	}
 	m.input.Focus()
 	m.syncInputHeight()
-	return textarea.Blink
+	return m.blinkCmd()
 }
 
 // updateInput is the single choke point for feeding a key to the textarea while
@@ -774,7 +933,7 @@ func (s *Session) displayModel() string {
 
 func (m *Model) Init() tea.Cmd {
 	// Drain here too: New queued the intro banner before the program started.
-	return tea.Batch(textarea.Blink, m.waitForEvent(), m.out.drainCmd())
+	return tea.Batch(m.blinkCmd(), m.waitForEvent(), m.out.drainCmd())
 }
 
 // waitForEvent yields the next message from the agent goroutine.
@@ -795,6 +954,10 @@ func (m *Model) waitForEvent() tea.Cmd {
 // return can never silently swallow output.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	model, cmd := m.update(msg)
+	m.syncTitle()
+	if spin := m.syncSpinner(); spin != nil {
+		cmd = tea.Batch(cmd, spin)
+	}
 	if out := m.out.drainCmd(); out != nil {
 		return model, tea.Batch(cmd, out)
 	}
@@ -810,10 +973,24 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingReflow = "\r" + ansi.CursorUp(d) + ansi.EraseScreenBelow
 		}
 		m.resize(msg.Width, msg.Height)
+		// An initial prompt waits for the first size: until then nothing is
+		// laid out, and the turn's first lines would render at width zero.
+		if p := m.pendingInitialPrompt(); p != "" {
+			m.input.SetValue(p)
+			return m.submitInput()
+		}
 		return m, nil
 
 	case tea.KeyMsg:
-		return m.onKey(msg)
+		return m.onKeys(msg)
+
+	case tea.FocusMsg:
+		m.focused, m.focusKnown = true, true
+		return m, nil
+
+	case tea.BlurMsg:
+		m.focused, m.focusKnown = false, true
+		return m, nil
 
 	case eventMsg:
 		m.renderEvent(msg.ev)
@@ -834,57 +1011,37 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.onBangResult(msg)
 
 	case permissionMsg:
-		// Session rules are about tools, and a host change is not a question
-		// about a tool. An allow rule for Bash must not answer "may I restart
-		// nginx?" — that is exactly the laundering the gate ordering prevents
-		// in the agent loop, and it would be pointless to reintroduce here.
-		if msg.req.HostChange == nil {
-			if permission.MatchAny(m.sessionDeny, msg.req.ToolName, msg.req.Specifier) {
-				msg.reply <- permission.Decision{Behavior: permission.Deny, Message: "denied by session rule"}
-				return m, m.waitForEvent()
-			}
-			if permission.MatchAny(m.sessionAllow, msg.req.ToolName, msg.req.Specifier) {
-				msg.reply <- permission.Decision{Behavior: permission.Allow}
-				return m, m.waitForEvent()
-			}
-		}
-		m.setState(stateAwaitingPermission)
-		m.pending = msg.reply
-		m.pendingReq = msg.req
-		if msg.req.HostChange != nil {
-			for _, line := range hostCardLines(msg.req.HostChange) {
-				m.appendLine(line)
-			}
+		// One prompt at a time. A cancelled ask is still queued when one is
+		// already on screen: the child may be alive when the ask arrives and
+		// gone by the time it would be shown, and showNextAsk drops it then.
+		// Dropped immediately, it never gets the chance to be skipped in
+		// favour of the ask behind it.
+		if m.pending != nil || m.askReply != nil {
+			m.askQueue = append(m.askQueue, queuedAsk{permission: &msg})
 			return m, m.waitForEvent()
 		}
-		m.appendLine(askStyle.Render("Permission required: " + m.permissionSummary(msg.req)))
-		if detail := permissionDetail(msg.req); detail != "" {
-			m.appendLine(toolStyle.Render("  " + detail))
+		if msg.ctx != nil && msg.ctx.Err() != nil {
+			return m, m.waitForEvent()
 		}
-		// The actionable prompt lives only in the persistent bottom view (see
-		// bottomView/stateAwaitingPermission) — don't duplicate it in scrollback.
+		m.showPermission(msg)
 		return m, m.waitForEvent()
 
 	case askMsg:
-		m.setState(stateAwaitingAnswer)
-		m.askReply = msg.reply
-		m.askOptions = msg.options
-		m.askQuestion = msg.question
-		m.appendLine(askStyle.Render("? " + msg.question))
-		for i, o := range msg.options {
-			line := fmt.Sprintf("  %d) %s", i+1, o.Label)
-			if o.Description != "" {
-				line += " — " + o.Description
-			}
-			m.appendLine(toolStyle.Render(line))
+		if m.pending != nil || m.askReply != nil {
+			m.askQueue = append(m.askQueue, queuedAsk{ask: &msg})
+			return m, m.waitForEvent()
 		}
-		// Always last, always present: see otherAnswerLabel.
-		m.appendLine(hintStyle.Render(fmt.Sprintf("  %d) %s", len(msg.options)+1, otherAnswerLabel)))
+		if msg.ctx != nil && msg.ctx.Err() != nil {
+			return m, m.waitForEvent()
+		}
+		m.showAsk(msg)
 		return m, m.waitForEvent()
 
 	case planMsg:
+		m.closeChoiceForPrompt()
 		m.setState(stateAwaitingPlan)
 		m.planReply = msg.reply
+		m.notifyAttention("Klaudia proposed a plan")
 		m.appendLine(askStyle.Render("Proposed plan:"))
 		m.appendMarkdown(msg.plan)
 		// The y/n prompt lives only in the persistent bottom view (see
@@ -896,6 +1053,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		elapsed := m.sw.Elapsed()
 		stopSW := m.sw.Stop()
 		m.turnCancel = nil
+		m.turnInFlight = false
 		m.cancelling = false // the goroutine returned; we're past the cancel window
 		m.flushAssistant()   // prettify the final answer through glamour
 		switch {
@@ -939,6 +1097,16 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statTurns += msg.res.NumTurns - m.turnLiveTurns
 		m.statIn += msg.res.InputTokens - m.turnLiveIn
 		m.statOut += msg.res.OutputTokens - m.turnLiveOut
+		// Cache tokens have no live delta, so add the whole turn's Result totals
+		// (each turn is one loop.Run, so its Cache* fields are that turn's cost).
+		m.statCacheRead += msg.res.CacheReadInputTokens
+		m.statCacheWrite += msg.res.CacheCreationInputTokens
+		// A child's tokens are priced against its own model and are not in
+		// the Result's token totals, so the cost it already computed is
+		// kept beside the session's own.
+		for _, c := range msg.res.Children {
+			m.statChildCost += c.CostUSD
+		}
 		m.turnLiveTurns, m.turnLiveIn, m.turnLiveOut = 0, 0, 0
 		// Clear phase state too so a queued-message follow-up turn starts
 		// fresh — a stale "running Bash" or "quiet for 90s" would otherwise
@@ -955,7 +1123,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.loopRemaining > 0 || m.loopWrapUp {
 			if next := m.loopNext(msg.res, msg.err); next != "" {
 				m.setState(stateRunning)
-				return m, tea.Batch(m.waitForEvent(), m.startTurn(next), stopSW)
+				return m, tea.Batch(m.waitForEvent(), m.startTurn(next, nil), stopSW)
 			}
 		}
 		// A queued message becomes the next turn. Two sources, in priority
@@ -971,10 +1139,13 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if q := strings.TrimSpace(resend.Text); q != "" {
 			m.pushHistory(q)
 			m.appendLine(userStyle.Render("› ") + q)
-			m.setState(stateRunning)
 			// q is the chip form (kept short for the queued hint and ↑ recall);
-			// expand it only on the way to the model.
-			next := m.pastes.expand(q)
+			// expand it only on the way to the model — pastes first, then @file
+			// references (contents inlined, images attached).
+			next, images := m.expandAtRefs(m.pastes.expand(q))
+			// Indexed like a typed prompt, so /outline and /search --mine see
+			// every message the user sent, however it was delivered.
+			m.noteNav(navUser, q, next, 0)
 			// An interrupt kills the foreground command but leaves managed
 			// background jobs running (they are session-scoped). The model was
 			// mid-task when cut off, so tell it what is still up and let it
@@ -984,11 +1155,23 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					next = note + "\n\n" + next
 				}
 			}
-			return m, tea.Batch(m.waitForEvent(), m.startTurn(next), stopSW)
+			return m, tea.Batch(m.waitForEvent(), m.startTurn(next, images), stopSW)
 		}
-		m.setState(stateIdle)
+		// The turn is over and nothing follows it: Klaudia is now waiting on the
+		// user. Notify here rather than at the top of the handler so a goal-loop
+		// iteration or a queued follow-up — which don't hand control back —
+		// doesn't ring the bell.
+		switch {
+		case errors.Is(msg.err, context.Canceled):
+			m.notifyAttention("Klaudia stopped")
+		case msg.err != nil:
+			m.notifyAttention("Klaudia hit an error")
+		default:
+			m.notifyAttention("Klaudia finished")
+		}
+		m.settleState(stateIdle)
 		m.input.Focus()
-		return m, tea.Batch(textarea.Blink, m.waitForEvent(), stopSW)
+		return m, tea.Batch(m.blinkCmd(), m.waitForEvent(), stopSW)
 
 	case modelsMsg:
 		if msg.err != nil {
@@ -996,6 +1179,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendLine(hintStyle.Render("  You can still set one by name: /model <id>"))
 			return m, nil
 		}
+		m.knownModels = msg.models
 		m.showModelPicker(msg.models)
 		return m, nil
 
@@ -1008,18 +1192,32 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case editDraftDoneMsg:
+		m.applyEditedDraft(msg)
+		return m, nil
+
+	case summaryEditDoneMsg:
+		return m.onSummaryEditDone(msg)
+
 	case compactDoneMsg:
 		if msg.err != nil {
 			m.appendLine(errStyle.Render("compact: " + api.FriendlyError(msg.err)))
 		} else {
 			m.history = msg.history
-			m.appendLine(bannerStyle.Render("Compacted conversation. Summary:\n" + strings.TrimSpace(msg.summary)))
+			m.lastSummary = strings.TrimSpace(msg.summary)
+			m.appendLine(bannerStyle.Render("Compacted conversation. Summary:\n" + m.lastSummary))
 		}
-		m.setState(stateIdle)
+		m.settleState(stateIdle)
 		m.input.Focus()
-		return m, tea.Batch(textarea.Blink, m.waitForEvent())
+		return m, tea.Batch(m.blinkCmd(), m.waitForEvent())
 
 	case spinner.TickMsg:
+		// Off screen, a tick is a wake-up that draws nothing; let the loop
+		// lapse, and syncSpinner re-arms it when the running state returns.
+		if m.state != stateRunning {
+			m.spinning = false
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.spin, cmd = m.spin.Update(msg)
 		return m, cmd
@@ -1079,8 +1277,7 @@ func (m *Model) onCtrlC() (tea.Model, tea.Cmd) {
 		m.appendLine(toolStyle.Render("  → cancelled"))
 		return m, nil
 	case stateAwaitingChoice:
-		m.choiceItems, m.choicePrompt = nil, ""
-		m.setState(stateIdle)
+		m.closeChoice()
 		m.appendLine(toolStyle.Render("  → cancelled"))
 		return m, nil
 	}
@@ -1132,10 +1329,35 @@ func (m *Model) promptValue() string {
 	return m.pastes.expand(m.input.Value())
 }
 
+// expandAtRefs turns "@path" references in a submitted prompt into the payload
+// the model receives: text files inlined behind a delimiter, images returned as
+// attachments to hang on the user message (atfile.go). It runs at submit, not
+// while typing, so the transcript keeps the short "@path" the user wrote. Any
+// reference that could not be expanded (missing / oversized / binary) is
+// surfaced as a faint note in the terminal, not sent to the model.
+func (m *Model) expandAtRefs(text string) (string, []tools.ResultImage) {
+	res := expandAtFiles(text, m.rootDir())
+	for _, note := range res.Notes {
+		m.appendLine(hintStyle.Render("  " + note))
+	}
+	return res.Prompt, res.Images
+}
+
 func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Any key other than Ctrl+C disarms a pending "press again to quit".
 	if msg.Type != tea.KeyCtrlC {
 		m.quitArmed = false
+	}
+
+	// An open Ctrl+R search owns the keyboard, Esc and Ctrl+C included: both
+	// cancel the search, not the session. A key it passes on accepts the match
+	// and is then handled as usual.
+	if m.search.active && m.state == stateIdle {
+		if m.onSearchKey(msg) {
+			return m, nil
+		}
+	} else if m.search.active {
+		m.search = historySearch{} // the state changed under it
 	}
 
 	switch msg.Type {
@@ -1148,12 +1370,36 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.stopFollow() {
 			return m, nil
 		}
+		// Esc on an open picker dismisses the picker, whatever is running
+		// behind it: the hint on screen says "esc to cancel", and a picker
+		// opened mid-turn (/mode while Klaudia works) is not a request to
+		// stop the turn.
+		if m.state == stateAwaitingChoice {
+			m.closeChoice()
+			m.appendLine(toolStyle.Render("  → cancelled"))
+			return m, nil
+		}
 		// Interrupt the in-flight turn (and any pending approval/question it is
 		// blocked on). The cancelled context unblocks the agent goroutine, which
 		// then sends doneMsg.
 		if m.turnCancel != nil {
 			m.interruptTurn()
 			return m, nil
+		}
+	case tea.KeyCtrlZ:
+		// Raw mode delivers Ctrl+Z as a key, not SIGTSTP, so job control only
+		// works if we ask for it. Bubble Tea restores the terminal before
+		// stopping and repaints on fg.
+		return m, tea.Suspend
+	case tea.KeyCtrlL:
+		// The shell convention: clear the visible screen. Output already
+		// printed stays in the terminal's scrollback.
+		return m, tea.ClearScreen
+	case tea.KeyCtrlD:
+		// EOF on an empty idle prompt quits, as in a shell. Anywhere else it
+		// keeps the textarea's delete-forward meaning.
+		if m.state == stateIdle && m.input.Value() == "" {
+			return m, tea.Quit
 		}
 	}
 
@@ -1163,6 +1409,14 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// never sees it (see paste.go).
 	if msg.Paste {
 		return m.onPaste(string(msg.Runes))
+	}
+
+	// Ctrl+G opens the current draft in $EDITOR. Only where the box holds a
+	// real, editable draft (idle, queuing a follow-up, or answering in your own
+	// words) — not on a y/n or numbered prompt, where the box is a placeholder
+	// and the keystroke would land on nothing.
+	if msg.Type == tea.KeyCtrlG && m.editableInput() {
+		return m, m.editDraft()
 	}
 
 	// What Return means depends on config (see keyAction). Computed once, so
@@ -1188,7 +1442,12 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case action == actionSubmit:
 			in := m.readInput()
-			if strings.HasPrefix(in.Display, "/") {
+			// A "/…" line that is really a prompt (a path, or the "//" escape)
+			// is queued like any other text. The queued display keeps what was
+			// typed, so ↑ recall and a resubmit route the same way again.
+			if routed, ok := m.slashAsPrompt(in); ok {
+				in.Prompt = routed.Prompt
+			} else if strings.HasPrefix(in.Display, "/") {
 				m.input.Reset()
 				m.pushHistory(in.Display)
 				m.appendLine(userStyle.Render("› ") + in.Display)
@@ -1240,8 +1499,14 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "y":
 			m.planReply <- true
 			m.planReply = nil
-			m.sess.PermissionMode = string(permission.ModeAcceptEdits) // leave plan mode
-			m.appendLine(toolStyle.Render("  → approved; plan mode off (acceptEdits)"))
+			// Autonomous, not a halfway mode. acceptEdits used to be the
+			// landing spot, which left the session allowing edits but asking
+			// before every command — and, because the host gate was untouched
+			// and already enforcing, /trust upgrade reported "already
+			// enforcing" and would not move it. Approving a plan means "go
+			// and do this".
+			m.sess.PermissionMode = string(permission.ModeAutonomous)
+			m.appendLine(toolStyle.Render("  → approved; plan mode off (autonomous)"))
 			m.setState(stateRunning)
 		case "n":
 			m.planReply <- false
@@ -1270,22 +1535,7 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.state == stateAwaitingChoice {
-		if msg.Type == tea.KeyEsc {
-			m.choiceItems, m.choicePrompt = nil, ""
-			m.setState(stateIdle)
-			m.appendLine(toolStyle.Render("  → cancelled"))
-			return m, nil
-		}
-		s := msg.String()
-		if len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
-			if n := int(s[0] - '0'); n <= len(m.choiceItems) {
-				item := m.choiceItems[n-1]
-				m.choiceItems, m.choicePrompt = nil, ""
-				m.setState(stateIdle)
-				m.appendLine(bannerStyle.Render("  → " + item.apply()))
-			}
-		}
-		return m, nil
+		return m.onChoiceKey(msg)
 	}
 
 	if m.state == stateAwaitingAnswer {
@@ -1341,17 +1591,6 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch strings.ToLower(msg.String()) {
 		case "y":
 			m.answer(permission.Decision{Behavior: permission.Allow})
-		case "a":
-			// No always-allow for a host change. A standing permission to
-			// reconfigure the machine is one the user cannot see and did not
-			// schedule the end of; approving the operation is the durable
-			// answer this model offers, and it ends with the session.
-			if host {
-				return m, nil
-			}
-			rule := permission.Rule{Tool: m.pendingReq.ToolName, Specifier: m.pendingReq.Specifier}
-			m.rememberPermission("allow", rule)
-			m.answer(permission.Decision{Behavior: permission.Allow})
 		case "n":
 			msg := "denied by user"
 			if host {
@@ -1359,22 +1598,15 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.answer(permission.Decision{Behavior: permission.Deny, Message: msg})
 		case "s":
-			// "Something else" is not "no". Someone declining a host change
-			// usually wants the task done differently, not abandoned — and the
-			// plain refusal tells the model to stop looking, which is right for
-			// "no" and wrong here. The turn stays alive and whatever they type
-			// next lands before Klaudia's next action, through the same steering
-			// path a mid-turn correction uses.
-			if !host {
-				return m, nil
-			}
-			m.hostRedirect = true
-			m.answer(permission.Decision{
-				Behavior: permission.Deny,
-				Message: "The user declined this change to their machine and is redirecting. " +
-					"Do not look for another way to make it. They are about to say what they want " +
-					"instead — wait for that instruction and follow it.",
-			})
+			// "Something else" is not "no". Someone declining an action usually
+			// wants the task done differently, not abandoned — and the plain
+			// refusal tells the model to stop looking, which is right for "no"
+			// and wrong here. The turn stays alive and whatever they type next
+			// lands before Klaudia's next action, through the same steering path
+			// a mid-turn correction uses. It began on host changes; an ordinary
+			// tool ask is declined for the same reason just as often.
+			m.redirect = true
+			m.answer(permission.Decision{Behavior: permission.Deny, Message: redirectDenial(host)})
 		}
 		return m, nil
 	}
@@ -1385,19 +1617,26 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Tab completion on an idle line: slash command when the line is a "/token",
-	// otherwise an @<path> reference.
+	// the command's argument when it has a completer, otherwise an @<path>
+	// reference.
 	if m.state == stateIdle && msg.Type == tea.KeyTab {
-		if strings.HasPrefix(m.input.Value(), "/") && !strings.ContainsAny(m.input.Value(), " \t") {
+		switch {
+		case strings.HasPrefix(m.input.Value(), "/") && !strings.ContainsAny(m.input.Value(), " \t"):
 			m.completeSlash()
-		} else {
+		case m.completeSlashArg():
+		default:
 			m.completeAtPath()
 		}
 		return m, nil
 	}
 
-	// Input history navigation (only on a fresh idle line).
-	if m.state == stateIdle && m.input.LineCount() <= 1 && (msg.Type == tea.KeyUp || msg.Type == tea.KeyDown) {
+	// Input history: ↑/↓ at the top/bottom row browse it, Ctrl+R searches it.
+	if m.historyKey(msg) {
 		m.navigateHistory(msg.Type == tea.KeyUp)
+		return m, nil
+	}
+	if m.state == stateIdle && msg.Type == tea.KeyCtrlR {
+		m.beginHistorySearch()
 		return m, nil
 	}
 
@@ -1407,7 +1646,33 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if action == actionSubmit && m.state == stateIdle && isBang(m.input.Value()) {
+	if action == actionSubmit && m.state == stateIdle {
+		return m.submitInput()
+	}
+
+	return m, m.updateInput(msg)
+}
+
+// pendingInitialPrompt returns the session's InitialPrompt the first time it is
+// asked while idle, and "" ever after, so a resize cannot send it twice.
+func (m *Model) pendingInitialPrompt() string {
+	if m.initialPromptSent || m.sess == nil || m.state != stateIdle {
+		return ""
+	}
+	p := strings.TrimSpace(m.sess.InitialPrompt)
+	if p == "" {
+		return ""
+	}
+	m.initialPromptSent = true
+	return p
+}
+
+// submitInput sends what is in the input box: a `!` command, a slash command,
+// or a prompt to the model. It is the Enter key's action, and also how an
+// initial prompt (--prompt-interactive) is sent, so that one takes exactly the
+// route a typed one would — @file expansion, slash routing, history.
+func (m *Model) submitInput() (tea.Model, tea.Cmd) {
+	if isBang(m.input.Value()) {
 		in := m.readInput()
 		m.input.Reset()
 		m.pushHistory(in.Display)
@@ -1416,88 +1681,139 @@ func (m *Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.runBang(in.Prompt)
 	}
 
-	if action == actionSubmit && m.state == stateIdle {
+	{
 		in := m.readInput()
 		if in.Empty() {
 			return m, nil
 		}
 		m.input.Reset()
+		// History keeps what was typed, so ↑ and Enter route the same way again
+		// ("//" included); the transcript shows what is actually sent.
 		m.pushHistory(in.Display)
+		routed, isPrompt := m.slashAsPrompt(in)
+		in = routed
 		m.appendLine(userStyle.Render("› ") + in.Display)
 		m.noteNav(navUser, in.Display, in.Prompt, 0)
 
 		// Slash commands are handled locally, not sent to the model.
-		if strings.HasPrefix(in.Display, "/") {
+		if !isPrompt && strings.HasPrefix(in.Display, "/") {
 			return m.handleSlash(in.Prompt)
 		}
 
 		m.setState(stateRunning)
+		// Expand any @file references now, on the way to the model: contents are
+		// inlined and images become attachments, while the transcript keeps the
+		// short @path already echoed above.
+		prompt, images := m.expandAtRefs(in.Prompt)
 		// Do NOT arm another waitForEvent here: exactly one channel reader must
 		// be outstanding (Init armed it; each channel-event handler re-arms it).
 		// A second reader would race and deliver streamed deltas out of order.
 		// startTurn returns only spinner/stopwatch ticks (separate cmd loops).
-		return m, m.startTurn(in.Prompt)
+		return m, m.startTurn(prompt, images)
 	}
-
-	return m, m.updateInput(msg)
 }
 
 // cmdInfo describes one slash command — the single source of truth for both
-// /help and the type-ahead suggestions, so the two can never drift.
-type cmdInfo struct{ name, args, desc string }
+// /help and the type-ahead suggestions, so the two can never drift. complete,
+// when set, offers the candidates for the command's next argument on Tab (see
+// argcomplete.go); a command without one leaves Tab to @path completion.
+type cmdInfo struct {
+	name, args, desc string
+	complete         argCompleter
+}
+
+// helpColumn is the width of the usage column in /help.
+const helpColumn = 20
 
 var commandList = []cmdInfo{
-	{"/help", "", "Show this help"},
-	{"/model", "[name]", "Pick a model from the provider (no arg), or set one by alias/ID"},
-	{"/theme", "[name]", "Change Markdown render theme (no arg = picker)"},
-	{"/mode", "[name]", "Change how Klaudia asks permission (no arg = picker)"},
-	{"!<command>", "", "Run a shell command directly; its output becomes context for Klaudia"},
-	{"/stop", "", "Ask Klaudia to finish the current step and stop, keeping what it has done"},
-	{"/changes", "", "Show the working tree split into your changes and Klaudia's"},
-	{"/undo", "", "Undo Klaudia's last change, leaving anything you also touched alone"},
-	{"/jobs", "", "List background jobs: what's running, on what port, and where"},
-	{"/logs", "[-f|--errors] <job>", "Page a job's log ($PAGER), tail it (-f), or pull just its errors into the conversation"},
-	{"/restart", "<job>", "Restart a background job in place, keeping its name and log"},
-	{"/stopjob", "<job|all>", "Stop a background job and its whole process group"},
-	{"/trust", "[upgrade|observe|off|revoke <id>]", "Show what Klaudia may change on this machine, and what it already may"},
-	{"/goal", "[run N|stop|text]", "No arg: goal-setting (draft/load a spec). run [N]: iterate to the goal. stop: halt. text: standing reminder"},
-	{"/memory", "[add|recent|stale|tag|promote|supersede]", "Show / audit / curate memory; no args views the index"},
-	{"/mcp", "", "List MCP servers; reconnect or disconnect them"},
-	{"/stats", "", "Show session stats (turns, tokens)"},
-	{"/status", "", "Show the current session settings"},
-	{"/config", "", "Show resolved provider/model/sandbox settings"},
-	{"/agents", "", "List available sub-agent types"},
-	{"/context", "", "Show what Klaudia has in context: pinned, changed, active, recently inspected"},
-	{"/pin", "[path]", "Keep a file in context every turn (survives compaction)"},
-	{"/unpin", "<path>", "Stop pinning a file"},
-	{"/forget", "<path>", "Drop a file from the tracked context"},
-	{"/compact", "", "Summarize and compact the conversation history now"},
-	{"/add-dir", "<path>", "Add a directory to the prompt context"},
-	{"/plan", "[off]", "Enter (or leave) read-only plan mode"},
-	{"/doctor", "", "Run environment diagnostics"},
-	{"/diff", "[args]", "Show git diff of the working tree"},
-	{"/commit", "<msg>", "Stage all changes and commit (asks first)"},
-	{"/export", "", "Export the conversation to a Markdown file"},
-	{"/last", "[n|list]", "Show a tool output in full (no arg = latest; list = index)"},
-	{"/copy", "[target]", "Copy to the clipboard: answer (default) | code [N] | out | all"},
-	{"/search", "<query>", "Search the session (--mine, --answers, --tools, --errors; /regex/)"},
-	{"/outline", "", "Show a session outline of prompts, tool calls, and errors"},
-	{"/show", "<n>", "Show one entry from /search or /outline in full"},
-	{"/errors", "[n]", "List the most recent errors"},
-	{"/open", "<path:line>", "Open a file reference in $EDITOR (paths from stack traces work)"},
-	{"/clear", "", "Clear the screen and conversation history"},
-	{"/quit", "", "Exit Klaudia (alias /exit)"},
+	{"/help", "", "Show this help", nil},
+	{"/model", "[name]", "Pick a model from the provider (no arg), or set one by alias/ID", completeModelArg},
+	{"/effort", "[level|default]", "Show or set reasoning effort: low, medium, high, xhigh, max", nil},
+	{"/theme", "[name]", "Change Markdown render theme (no arg = picker)", completeThemeArg},
+	{"/mode", "[name]", "Change how Klaudia asks permission (no arg = picker)", completeModeArg},
+	{"!<command>", "", "Run a shell command directly; its output becomes context for Klaudia", nil},
+	{"/stop", "", "Ask Klaudia to finish the current step and stop, keeping what it has done", nil},
+	{"/changes", "", "Show the working tree split into your changes and Klaudia's", nil},
+	{"/undo", "", "Undo Klaudia's last change, leaving anything you also touched alone", nil},
+	{"/rewind", "[N]", "Drop the last N exchanges from the conversation (default 1) so you can back out recent turns", nil},
+	{"/jobs", "", "List background jobs: what's running, on what port, and where", nil},
+	{"/logs", "[-f|--errors] <job>", "Page a job's log ($PAGER), tail it (-f), or pull just its errors into the conversation; /logs stop ends a -f tail", completeLogsArg},
+	{"/restart", "<job>", "Restart a background job in place, keeping its name and log", completeJobArg},
+	{"/stopjob", "<job|all>", "Stop a background job and its whole process group", completeStopJobArg},
+	{"/trust", "[revoke <id|all>]", "Show what Klaudia may change on this machine, and what it already may", completeTrustArg},
+	{"/goal", "[run N|stop|clear|text]", "No arg: goal-setting (draft/load a spec). run [N] [commit|refuse] [no-branch] [no-commit|artifact]: iterate to the goal alongside any uncommitted changes, which it may not discard (commit: commit them to the goal branch first; refuse: do not start if there are any; no-branch/no-commit skip the goal branch and per-iteration commits). stop: halt. clear: drop the standing reminder. text: standing reminder", nil},
+	{"/memory", "[add|recent|stale|tag|promote|supersede]", "Show / audit / curate memory; no args views the index", nil},
+	{"/mcp", "", "List MCP servers; reconnect or disconnect them", nil},
+	{"/stats", "", "Show session stats (turns, tokens)", nil},
+	{"/status", "", "Show the current session settings", nil},
+	{"/config", "", "Show resolved provider/model/sandbox settings", nil},
+	{"/agents", "", "List available sub-agent types", nil},
+	{"/context", "", "Show what Klaudia has in context: pinned, changed, active, recently inspected", nil},
+	{"/pin", "[path]", "Keep a file in context every turn (survives compaction)", nil},
+	{"/unpin", "<path>", "Stop pinning a file", completeUnpinArg},
+	{"/forget", "<path>", "Drop a file from the tracked context", nil},
+	{"/compact", "[focus]", "Summarize and compact history now (focus text emphasizes what to keep)", nil},
+	{"/summary", "[edit]", "Show the last compaction summary; 'edit' opens it in $EDITOR to revise", nil},
+	{"/add-dir", "<path>", "Add a directory to the prompt context", nil},
+	{"/plan", "[off]", "Enter (or leave) read-only plan mode", nil},
+	{"/doctor", "", "Run environment diagnostics", nil},
+	{"/diff", "[args]", "Show git diff of the working tree", nil},
+	{"/commit", "<msg>", "Stage all changes and commit (asks first)", nil},
+	{"/export", "", "Export the conversation to a Markdown file", nil},
+	{"/last", "[n|list]", "Show a tool output in full (no arg = latest; list or ls = index)", completeLastArg},
+	{"/copy", "[target]", "Copy to the clipboard: answer (default) | code [N] | out | all", nil},
+	{"/search", "<query>", "Search the session (--mine, --answers, --tools, --errors; /regex/)", nil},
+	{"/outline", "", "Show a session outline of prompts, tool calls, and errors", nil},
+	{"/show", "<n>", "Show one entry from /search or /outline in full", nil},
+	{"/errors", "[n]", "List the most recent errors", nil},
+	{"/open", "<path:line>", "Open a file reference in $EDITOR (paths from stack traces work)", nil},
+	{"/resume", "", "Pick a recent session to resume in place", nil},
+	{"/rename", "<title>", "Set a title for the current session", nil},
+	{"/clear", "", "Clear the screen and conversation history", nil},
+	{"/quit", "", "Exit Klaudia (alias /exit)", nil},
 }
 
 // keyHints documents the non-command key bindings shown in /help.
 const keyHints = `Keys:
   /                Type a slash to see matching commands
-  Tab              Complete a /command or an @<path> reference (Tab again cycles)
+  Tab              Complete a /command, its argument, or an @<path> reference (Tab again cycles)
   ↑ / ↓            Cycle through previous prompts
   Ctrl+J           Newline without sending
+  Ctrl+G           Edit the current draft in $EDITOR ($VISUAL, else vi/nano)
   Ctrl+U / Ctrl+K  Delete before / after the cursor
+  Ctrl+W           Delete the word before the cursor
+  Alt+← / Alt+→    Move by word
   Esc              Interrupt the model mid-turn
-  Ctrl+C           Interrupt, or clear the line — press twice to quit`
+  Ctrl+C           Interrupt, or clear the line — press twice to quit
+  Ctrl+D           Quit (on an empty prompt)
+  Ctrl+L           Clear the screen (scrollback is kept)
+  Ctrl+Z           Suspend to the shell (fg to return)`
+
+// commandAliases are names handleSlash accepts that commandList does not list,
+// because they are second spellings of a command already in it.
+var commandAliases = map[string]string{"?": "help", "exit": "quit"}
+
+// IsBuiltinCommand reports whether /name is a built-in slash command, and so
+// whether a skill of that name would be shadowed by it.
+//
+// Derived from commandList — the table that already drives /help and
+// type-ahead — rather than being written out again. The hand-kept copy this
+// replaced lived in internal/cli and had drifted both ways: it still reserved
+// /allow and /deny after the rule model was removed, and had never learned
+// about /trust, /undo, /jobs and fifteen others, so a skill named "undo" was
+// silently unreachable instead of warned about.
+func IsBuiltinCommand(name string) bool {
+	name = strings.TrimPrefix(name, "/")
+	if _, ok := commandAliases[name]; ok {
+		return true
+	}
+	for _, c := range commandList {
+		if strings.TrimPrefix(c.name, "/") == name {
+			return true
+		}
+	}
+	return false
+}
 
 // slashHelp renders the command reference from commandList + keyHints.
 func slashHelp() string {
@@ -1508,7 +1824,13 @@ func slashHelp() string {
 		if c.args != "" {
 			left += " " + c.args
 		}
-		fmt.Fprintf(&b, "\n  %-16s %s", left, c.desc)
+		// A usage longer than the column gets its description on the next
+		// line, so one long entry can't push every description out of line.
+		if len([]rune(left)) > helpColumn {
+			fmt.Fprintf(&b, "\n  %s\n  %-*s %s", left, helpColumn, "", c.desc)
+			continue
+		}
+		fmt.Fprintf(&b, "\n  %-*s %s", helpColumn, left, c.desc)
 	}
 	b.WriteString("\n\n")
 	b.WriteString(keyHints)
@@ -1561,24 +1883,70 @@ func (m *Model) slashSuggestionLine() string {
 	return suggestStyle.Render(strings.Join(sug, "  ")) + hintStyle.Render("  (Tab to complete)")
 }
 
-// startChoice opens a numbered settings picker. The selected item's apply runs
-// when the user presses its digit (Esc cancels). Reusable for any quick toggle.
+// startChoice opens a settings picker. The selected item's apply runs when the
+// user picks it — Enter on the highlighted row, or its digit (Esc cancels).
+// Reusable for any quick toggle. The list is drawn in the live region by
+// choiceView, not printed to scrollback, so the highlight can move.
+//
+// A picker can open over a running turn (/mode, /mcp, or a /model list that
+// arrives after a turn started): the turn keeps going, and closing the picker
+// returns to stateRunning rather than idle. Returning to idle mid-turn is what
+// let Enter start a second, concurrent turn. It does not open over a prompt the
+// turn is blocked on — that prompt owns the keyboard and would be hidden.
 func (m *Model) startChoice(title string, items []choiceItem) {
+	switch m.state {
+	case stateIdle, stateRunning:
+		m.choiceReturn = m.state
+	case stateAwaitingChoice:
+		// One picker replacing another (a /model list landing while /mode is
+		// open): keep where the first one was going to return to.
+	default:
+		m.appendLine(toolStyle.Render("  (not showing the picker: answer the prompt first, then try again)"))
+		return
+	}
 	m.choiceItems = items
 	m.choicePrompt = title
+	m.choiceNav = choiceNav{}
 	m.setState(stateAwaitingChoice)
-	m.appendLine(askStyle.Render(title))
-	for i, it := range items {
-		m.appendLine(toolStyle.Render(fmt.Sprintf("  %d) %s", i+1, it.label)))
-	}
 }
 
-// currentMode returns the live permission mode, defaulting to ModeDefault.
+// closeChoice dismisses the picker and returns to the state it opened over.
+func (m *Model) closeChoice() {
+	m.choiceItems, m.choicePrompt = nil, ""
+	m.choiceNav = choiceNav{}
+	m.setState(m.choiceReturn)
+}
+
+// closeChoiceForPrompt dismisses an open picker because the running turn now
+// needs an answer (approval, question, plan). That prompt takes the bottom
+// view; the picker's items are dropped rather than left stale, and the user is
+// told it closed so the missing picker is not a mystery.
+func (m *Model) closeChoiceForPrompt() {
+	if m.state != stateAwaitingChoice {
+		return
+	}
+	m.closeChoice()
+	m.appendLine(toolStyle.Render("  → picker closed: Klaudia needs an answer first"))
+}
+
+// settleState moves to s when background work (a turn, a compaction, a !
+// command) finishes. If a picker is open over that work it stays open, and s
+// becomes the state it returns to — otherwise the picker would vanish under the
+// user's fingers and a later digit would land in the input box.
+func (m *Model) settleState(s uiState) {
+	if m.state == stateAwaitingChoice {
+		m.choiceReturn = s
+		return
+	}
+	m.setState(s)
+}
+
+// currentMode returns the live permission mode, defaulting to ModeAutonomous.
 func (m *Model) currentMode() permission.Mode {
 	if m.sess != nil && m.sess.PermissionMode != "" {
 		return permission.Mode(m.sess.PermissionMode)
 	}
-	return permission.ModeDefault
+	return permission.ModeAutonomous
 }
 
 // modeChoices builds the permission-mode picker, marking the current mode.
@@ -1594,9 +1962,6 @@ func (m *Model) modeChoices() []choiceItem {
 		items = append(items, choiceItem{
 			label: label,
 			apply: func() string {
-				if why := m.modeRefusal(mode); why != "" {
-					return why
-				}
 				m.sess.PermissionMode = string(mode)
 				return "Permission mode: " + mode.Label()
 			},
@@ -1618,8 +1983,19 @@ func (m *Model) busyGuard(what string) bool {
 	return false
 }
 
+// saveGoal records the standing goal for resume, saying so when it cannot:
+// the goal still applies to this run, but a resume would not bring it back.
+func (m *Model) saveGoal() {
+	if m.sess == nil || m.sess.SaveGoal == nil {
+		return
+	}
+	if err := m.sess.SaveGoal(m.sess.Goal); err != nil {
+		m.appendLine(errStyle.Render("  could not save the standing goal for resume: " + err.Error()))
+	}
+}
+
 // toggleGoalSetting flips goal-setting mode. Turning it on loads any existing
-// spec (PRD.md / .klaudia/GOAL.md) or invites the user to describe the goal so
+// spec (.klaudia/GOAL.md, or a PRD.md shaped like one) or invites the user to describe the goal so
 // the model can draft one on the next turn; turning it off readies the loop.
 func (m *Model) toggleGoalSetting() (tea.Model, tea.Cmd) {
 	if m.goalSetting {
@@ -1633,6 +2009,7 @@ func (m *Model) toggleGoalSetting() (tea.Model, tea.Cmd) {
 		cwd = m.sess.CWD
 	}
 	text, specPath, _ := goal.Read(cwd)
+	m.noteIgnoredPRD(cwd)
 	if strings.TrimSpace(text) != "" {
 		m.appendLine(bannerStyle.Render(fmt.Sprintf(
 			"Goal-setting on. Loaded spec from %s:\n  %s\nRefine it in chat, /goal to finish, then /goal run to start.",
@@ -1643,6 +2020,14 @@ func (m *Model) toggleGoalSetting() (tea.Model, tea.Cmd) {
 			specPath)))
 	}
 	return m, nil
+}
+
+// noteIgnoredPRD says when ./PRD.md was passed over as the goal spec, so a
+// user who wrote one for the loop learns what it is missing.
+func (m *Model) noteIgnoredPRD(cwd string) {
+	if prd, ok := goal.IgnoredPRD(cwd); ok {
+		m.appendLine(toolStyle.Render("  " + goal.IgnoredPRDNote(prd)))
+	}
 }
 
 // startGoalLoop kicks off the "/goal run [N]" Ralph loop: requires a spec, moves
@@ -1658,15 +2043,36 @@ func (m *Model) startGoalLoop(args []string) (tea.Model, tea.Cmd) {
 	}
 	specText, specPath, _ := goal.Read(cwd)
 	if strings.TrimSpace(specText) == "" {
-		m.appendLine(errStyle.Render("No goal spec found. Run /goal first to create one (PRD.md or .klaudia/GOAL.md)."))
+		m.noteIgnoredPRD(cwd)
+		m.appendLine(errStyle.Render("No goal spec found. Run /goal first to create one (.klaudia/GOAL.md)."))
 		return m, nil
 	}
 
 	n := goal.DefaultIterations
-	if len(args) > 0 {
-		v, err := strconv.Atoi(args[0])
+	policy := gitguard.Allow
+	var flags goal.RunMode
+	for _, a := range args {
+		if p, err := gitguard.ParsePolicy(a); err == nil && a != "" {
+			policy = p
+			continue
+		}
+		switch a {
+		case "no-branch":
+			flags.NoBranch = true
+			continue
+		case "no-commit":
+			flags.NoCommit = true
+			continue
+		case "artifact":
+			flags = flags.Merge(goal.Artifact)
+			continue
+		}
+		v, err := strconv.Atoi(a)
 		if err != nil || v <= 0 {
-			m.appendLine(errStyle.Render("usage: /goal run [N]  (N = max iterations, a positive integer)"))
+			m.appendLine(errStyle.Render("usage: /goal run [N] [allow|commit|refuse] [no-branch] [no-commit|artifact]  " +
+				"(N = max iterations, a positive integer; allow (default) runs alongside uncommitted changes, " +
+				"commit commits them first, refuse stops if there are any; no-branch/no-commit drop the goal " +
+				"branch / per-iteration commits)"))
 			return m, nil
 		}
 		n = v
@@ -1676,11 +2082,36 @@ func (m *Model) startGoalLoop(args []string) (tea.Model, tea.Cmd) {
 		m.appendLine(toolStyle.Render(fmt.Sprintf("  capped at %d iterations.", goal.MaxIterations)))
 	}
 
+	mode := goal.SpecMode(specText).Merge(flags)
+	if mode.NoBranch && policy == gitguard.Commit {
+		m.appendLine(errStyle.Render("Not starting the goal loop: commit puts pre-existing changes on the goal branch, " +
+			"and this run has none (no-branch, or the spec's mode: artifact). Drop commit to run alongside them, or commit them yourself."))
+		return m, nil
+	}
+	m.loopMode = mode
+
+	// Uncommitted work that predates the loop is recorded before anything
+	// moves (#250), so the guard can keep the loop from discarding it. The
+	// loop runs alongside it by default; no clean tree is required.
+	m.loopGuard = nil
+	var baseline *gitguard.Baseline
+	if cwd != "" {
+		b, err := gitguard.Begin(cwd, policy, "use /goal run [N] commit to commit them to the goal branch first.", specPath)
+		if err != nil {
+			m.appendLine(errStyle.Render("Not starting the goal loop: " + err.Error()))
+			return m, nil
+		}
+		baseline = b
+	}
+
 	// Move onto a dedicated branch so iterations stay isolated and revertible.
 	// Reuse the branch if it already exists (resume prior work) rather than
 	// resetting it, so a second /goal run continues from earlier commits.
 	m.loopBranch, m.loopBaseBranch = "", ""
-	if cwd != "" {
+	if s := mode.String(); s != "" {
+		m.appendLine(toolStyle.Render("  ↳ " + s))
+	}
+	if cwd != "" && !mode.NoBranch {
 		branch := goal.BranchName(specText)
 		// Capture the branch we're starting from (the merge target) before we
 		// switch, unless we're already sitting on the goal branch (a resume).
@@ -1700,6 +2131,15 @@ func (m *Model) startGoalLoop(args []string) (tea.Model, tea.Cmd) {
 			m.appendLine(toolStyle.Render("  ↳ on branch " + branch))
 		}
 	}
+	baseline, note, err := baseline.Settle(policy, m.loopBranch != "", specPath)
+	if err != nil {
+		m.appendLine(errStyle.Render("Not starting the goal loop: " + err.Error()))
+		return m, nil
+	}
+	if note != "" {
+		m.appendLine(toolStyle.Render("  ↳ " + note))
+	}
+	m.loopGuard = baseline.Guard()
 
 	m.goalSetting = false
 	m.loopTotal, m.loopRemaining, m.loopSpecPath = n, n, specPath
@@ -1708,7 +2148,7 @@ func (m *Model) startGoalLoop(args []string) (tea.Model, tea.Cmd) {
 
 	prompt := m.prepareFirstLoopTurn(specPath, n)
 	m.setState(stateRunning)
-	return m, m.startTurn(prompt)
+	return m, m.startTurn(prompt, nil)
 }
 
 // prepareFirstLoopTurn selects the first turn's prompt for /goal run: either
@@ -1722,10 +2162,10 @@ func (m *Model) prepareFirstLoopTurn(specPath string, n int) string {
 		m.loopStubFixing = true
 		m.appendLine(toolStyle.Render(fmt.Sprintf("  ⚠ Progress tracker missing stubs for: %s — repairing first.", strings.Join(missing, ", "))))
 		m.appendLine(toolStyle.Render(fmt.Sprintf("  ↻ iteration 1/%d (stub fix)", n)))
-		return goal.StubFixPrompt(specPath, missing)
+		return goal.StubFixPromptFor(specPath, missing, m.loopMode)
 	}
 	m.appendLine(toolStyle.Render(fmt.Sprintf("  ↻ iteration 1/%d", n)))
-	return goal.IterationPrompt(specPath)
+	return goal.IterationPromptFor(specPath, m.loopMode)
 }
 
 // loopIsStall reports whether a finished iteration looks like an undetected
@@ -1829,11 +2269,11 @@ func (m *Model) continueIteration() string {
 	if m.loopRemaining > 0 {
 		next := m.loopTotal - m.loopRemaining + 1
 		m.appendLine(toolStyle.Render(fmt.Sprintf("  ↻ iteration %d/%d", next, m.loopTotal)))
-		return goal.IterationPrompt(m.loopSpecPath)
+		return goal.IterationPromptFor(m.loopSpecPath, m.loopMode)
 	}
 	m.loopWrapUp = true
 	m.appendLine(toolStyle.Render(fmt.Sprintf("  stopped after %d iteration(s); summarising progress to the spec…", m.loopTotal)))
-	return goal.WrapUpPrompt(m.loopSpecPath)
+	return goal.WrapUpPromptFor(m.loopSpecPath, m.loopMode)
 }
 
 // formatStats renders the /stats line. When the context limit is known, the
@@ -1858,6 +2298,33 @@ func (m *Model) appendMergeHint() {
 	}
 }
 
+// handleEffort backs /effort: no argument reports the current level, a level
+// sets it for the rest of the session, and "default" clears it so the model's
+// own default applies. It is read when a turn starts, as /model is, so a
+// change made while Klaudia is working applies from the next turn.
+func (m *Model) handleEffort(args []string) {
+	if len(args) == 0 {
+		m.appendLine(bannerStyle.Render("Effort: " + effortLabel(m.sess.Effort) +
+			" — /effort <" + strings.Join(api.EffortLevels, "|") + "|default> to change it"))
+		return
+	}
+	level, err := api.ParseEffort(args[0])
+	if err != nil {
+		m.appendLine(errStyle.Render(err.Error()))
+		return
+	}
+	m.sess.Effort = level
+	m.appendLine(bannerStyle.Render("Effort: " + effortLabel(level)))
+}
+
+// effortLabel names an effort setting for display.
+func effortLabel(level string) string {
+	if level == "" {
+		return "default"
+	}
+	return level
+}
+
 // handleSlash dispatches a slash command. Commands run locally and never reach
 // the model. Most are safe to run while a turn is in flight; the destructive
 // ones guard with busyGuard.
@@ -1880,11 +2347,21 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 		m.pastes.reset()
 		m.results.reset()
 		m.nav = nil
+		// A new session from here on: the cleared conversation keeps its own
+		// transcript (and summary) and is no longer what auto-resume picks.
+		msg := "Cleared conversation. Earlier output remains in terminal scrollback."
+		if m.sess.Rotate != nil {
+			newID, prevID := m.sess.Rotate()
+			m.sess.SessionID = newID
+			if prevID != "" {
+				msg += "\nThe cleared conversation is saved: klaudia --resume " + prevID
+			}
+		}
 		// Erase the visible screen, but deliberately not the scrollback: ESC[3J
 		// would destroy whatever the user had in the terminal before Klaudia
 		// started, and in tmux it wipes the whole pane's history. Earlier output
 		// stays scrollable, which is the point of rendering inline.
-		m.appendLine(bannerStyle.Render("Cleared conversation. Earlier output remains in terminal scrollback."))
+		m.appendLine(bannerStyle.Render(msg))
 		return m, tea.Sequence(tea.ClearScreen, m.out.drainCmd())
 	case "/search":
 		return m, m.searchConversation(args)
@@ -1902,7 +2379,10 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 		return m, m.showResult(args)
 	case "/model":
 		if len(args) > 0 {
-			m.setModel(args[0], 0)
+			m.appendLine(bannerStyle.Render(m.setModel(args[0], 0)))
+			if warn := m.unlistedModelWarning(args[0]); warn != "" {
+				m.appendLine(hintStyle.Render(warn))
+			}
 			break
 		}
 		cur := m.sess.Model
@@ -1919,6 +2399,8 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 		}
 		m.appendLine(bannerStyle.Render("Model: " + cur + " — fetching available models…"))
 		return m, m.fetchModels()
+	case "/effort":
+		m.handleEffort(args)
 	case "/theme":
 		if len(args) == 0 {
 			if m.state == stateRunning {
@@ -1961,9 +2443,11 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 		case strings.EqualFold(args[0], "clear"):
 			m.sess.Goal = ""
 			m.appendLine(bannerStyle.Render("Standing goal cleared."))
+			m.saveGoal()
 		default:
 			m.sess.Goal = strings.Join(args, " ")
 			m.appendLine(bannerStyle.Render("Standing goal set; it will be re-stated each turn:\n" + m.sess.Goal))
+			m.saveGoal()
 		}
 	case "/memory":
 		// Memory is always an interface value; headless mode gets memory.Disabled()
@@ -1988,6 +2472,9 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 				status = "○ disconnected"
 			}
 			fmt.Fprintf(&b, "\n  %s  %s (%d tools)", status, s.Name, s.Tools)
+			if s.ListErr != "" {
+				fmt.Fprintf(&b, " — tool list failed: %s", s.ListErr)
+			}
 			if s.Connected {
 				items = append(items, choiceItem{label: "Disconnect " + s.Name, apply: func() string {
 					if err := m.sess.MCP.Disconnect(s.Name); err != nil {
@@ -2004,32 +2491,33 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 				}})
 			}
 		}
+		var down []string
+		for _, s := range servers {
+			if !s.Connected {
+				down = append(down, s.Name)
+			}
+		}
+		if len(down) > 1 {
+			items = append([]choiceItem{{label: fmt.Sprintf("Reconnect all disconnected (%d)", len(down)), apply: func() string {
+				var failed []string
+				for _, name := range down {
+					if err := m.sess.MCP.Reconnect(name); err != nil {
+						failed = append(failed, name+": "+err.Error())
+					}
+				}
+				if len(failed) > 0 {
+					return fmt.Sprintf("Reconnected %d of %d; failed: %s", len(down)-len(failed), len(down), strings.Join(failed, "; "))
+				}
+				return fmt.Sprintf("Reconnected %d servers", len(down))
+			}}}, items...)
+		}
 		m.appendLine(bannerStyle.Render(b.String()))
 		m.startChoice("Manage MCP servers (Esc to leave as-is):", items)
 		return m, nil
 	case "/stats":
 		resident := compaction.EstimateTokens(m.history)
 		m.appendLine(bannerStyle.Render(formatStats(m.statTurns, m.statIn, m.statOut, resident, m.sess.ContextWindow, m.sess.ContextWindowSource)))
-	case "/allow", "/deny":
-		// Deprecated in favour of /trust: no longer listed in /help or offered
-		// by type-ahead, but still honoured so muscle memory and existing
-		// configs keep working. The hint is how anyone still typing it finds
-		// out where the pattern went.
-		if len(args) == 0 {
-			m.appendLine(errStyle.Render("usage: " + cmd + " <rule>  e.g. " + cmd + " Bash(go test:*)"))
-			break
-		}
-		rule, err := permission.ParseRule(strings.Join(args, " "))
-		if err != nil {
-			m.appendLine(errStyle.Render("invalid rule: " + err.Error()))
-			break
-		}
-		if cmd == "/allow" {
-			m.rememberPermission("allow", rule)
-		} else {
-			m.rememberPermission("deny", rule)
-		}
-		m.appendLine(hintStyle.Render(cmd + " is deprecated — /trust grants by what an operation does, not by matching command text"))
+		m.appendLine(bannerStyle.Render(formatCostStats(m.sessionModel(), m.sessionUsage(), m.statChildCost)))
 	case "/status":
 		model := m.sess.Model
 		if model == "" {
@@ -2039,17 +2527,20 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 		if m.sess.SessionID != "" {
 			resume = "\nresume: klaudia --resume " + m.sess.SessionID
 		}
-		m.appendLine(bannerStyle.Render(fmt.Sprintf("model=%s  permissions=%s  messages=%d%s",
-			model, m.currentMode().Label(), len(m.history), resume)))
+		m.appendLine(bannerStyle.Render(fmt.Sprintf("model=%s  effort=%s  permissions=%s  messages=%d%s",
+			model, effortLabel(m.sess.Effort), m.currentMode().Label(), len(m.history), resume)))
+	case "/resume":
+		if m.busyGuard("/resume") {
+			break
+		}
+		return m.startResumePicker()
+	case "/rename":
+		m.renameSession(strings.TrimSpace(strings.Join(args, " ")))
 	case "/mode":
 		if len(args) > 0 {
 			want := permission.Mode(args[0])
 			if !want.Valid() {
 				m.appendLine(errStyle.Render("unknown mode " + args[0] + ". Try /mode with no argument to pick one."))
-				break
-			}
-			if why := m.modeRefusal(want); why != "" {
-				m.appendLine(errStyle.Render(why))
 				break
 			}
 			m.sess.PermissionMode = string(want)
@@ -2070,6 +2561,8 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 		m.changesCommand()
 	case "/undo":
 		m.undoCommand()
+	case "/rewind":
+		m.rewindCommand(args)
 	case "/jobs":
 		m.jobsCommand()
 	case "/logs":
@@ -2089,7 +2582,7 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 	case "/config":
 		m.appendLine(bannerStyle.Render(m.renderConfig()))
 	case "/agents":
-		m.appendLine(bannerStyle.Render(m.renderAgents()))
+		m.appendLine(bannerStyle.Render(m.agentsCommand(args)))
 	case "/context":
 		m.appendLine(bannerStyle.Render(m.renderContext()))
 	case "/pin":
@@ -2107,7 +2600,11 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 			}
 			break
 		}
-		dir := strings.Join(args, " ")
+		dir, err := resolveAddDir(m.sess.CWD, strings.Join(args, " "))
+		if err != nil {
+			m.appendLine(errStyle.Render("/add-dir: " + err.Error()))
+			break
+		}
 		m.sess.ExtraDirs = append(m.sess.ExtraDirs, dir)
 		m.appendLine(bannerStyle.Render("Added directory (referenced in the prompt context next turn): " + dir))
 	case "/compact":
@@ -2122,17 +2619,31 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 			m.appendLine(bannerStyle.Render("Nothing to compact yet."))
 			break
 		}
-		m.appendLine(bannerStyle.Render("Compacting conversation…"))
+		focus := strings.TrimSpace(strings.Join(args, " "))
+		if focus != "" {
+			m.appendLine(bannerStyle.Render("Compacting conversation, focusing on: " + focus + "…"))
+		} else {
+			m.appendLine(bannerStyle.Render("Compacting conversation…"))
+		}
 		m.setState(stateRunning)
-		go func(hist []anthropic.BetaMessageParam) {
-			newHist, summary, err := m.sess.Compact(m.ctx, hist)
+		go func(hist []anthropic.BetaMessageParam, focus string) {
+			newHist, summary, err := m.sess.Compact(m.ctx, hist, focus)
 			m.events <- compactDoneMsg{history: newHist, summary: summary, err: err}
-		}(m.history)
-		return m, m.spin.Tick
+		}(m.history, focus)
+		return m, m.syncSpinner()
+	case "/summary":
+		return m.summaryCommand(args)
 	case "/plan":
-		if len(args) > 0 && strings.ToLower(args[0]) == "off" {
-			m.sess.PermissionMode = string(permission.ModeDefault)
-			m.appendLine(bannerStyle.Render("Left plan mode (default permissions)."))
+		if len(args) > 1 || (len(args) == 1 && !strings.EqualFold(args[0], "off")) {
+			m.appendLine(errStyle.Render("usage: /plan (enter plan mode) or /plan off (leave it)"))
+			break
+		}
+		if len(args) == 1 {
+			// Autonomous, not a mode that asks per action: leaving plan means
+			// getting on with it, and the host gate is what stops a change to
+			// this machine either way.
+			m.sess.PermissionMode = string(permission.ModeAutonomous)
+			m.appendLine(bannerStyle.Render("Left plan mode (autonomous)."))
 		} else {
 			m.sess.PermissionMode = string(permission.ModePlan)
 			m.appendLine(bannerStyle.Render("Entered plan mode: read-only exploration; mutations are blocked. /plan off to leave."))
@@ -2144,15 +2655,7 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 			m.appendLine(bannerStyle.Render(m.sess.Doctor()))
 		}
 	case "/diff":
-		out, err := gitOutput(m.sess.CWD, append([]string{"diff"}, args...)...)
-		switch {
-		case err != nil:
-			m.appendLine(errStyle.Render("git diff: " + err.Error()))
-		case strings.TrimSpace(out) == "":
-			m.appendLine(bannerStyle.Render("No changes."))
-		default:
-			m.appendLine(out)
-		}
+		return m, m.showDiff(args)
 	case "/export":
 		path, err := m.exportTranscript()
 		if err != nil {
@@ -2169,7 +2672,7 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 			break
 		}
 		message := strings.Join(args, " ")
-		status, err := gitOutput(m.sess.CWD, "status", "--short")
+		status, err := gitProbe(m.sess.CWD, "status", "--short")
 		if err != nil {
 			m.appendLine(errStyle.Render("git: " + err.Error()))
 			break
@@ -2225,9 +2728,9 @@ func (m *Model) handleSlash(input string) (tea.Model, tea.Cmd) {
 			rendered := sk.Render(strings.Join(args, " "))
 			m.appendLine(bannerStyle.Render("Running skill /" + sk.Name))
 			m.setState(stateRunning)
-			return m, m.startTurn(rendered)
+			return m, m.startTurn(rendered, nil)
 		}
-		m.appendLine(errStyle.Render("Unknown command " + cmd + ". Try /help."))
+		m.appendLine(errStyle.Render(m.unknownSlashMessage(cmd)))
 	}
 	return m, nil
 }
@@ -2249,8 +2752,8 @@ func (m *Model) renderConfig() string {
 	if sandbox == "" {
 		sandbox = "local"
 	}
-	return fmt.Sprintf("Configuration:\n  provider=%s\n  model=%s\n  sandbox=%s\n  permissions=%s\n\n  /mode to change permissions · /model to change the model",
-		provider, model, sandbox, m.currentMode().Label())
+	return fmt.Sprintf("Configuration:\n  provider=%s\n  model=%s\n  sandbox=%s\n  permissions=%s\n  notify=%s\n\n  /mode to change permissions · /model to change the model",
+		provider, model, sandbox, m.currentMode().Label(), m.sess.Notify)
 }
 
 // renderAgents lists the available sub-agent types (Agent tool subagent_type).
@@ -2267,6 +2770,14 @@ func (m *Model) renderAgents() string {
 }
 
 // renderContext shows the working directory, git branch, and model.
+
+// gitProbe is gitOutput for the read-only lookups Klaudia makes by itself
+// (status at startup, /diff, branch names): the repository's config cannot run
+// a program through them. See package gitprobe.
+func gitProbe(dir string, args ...string) (string, error) {
+	out, err := gitprobe.Command(dir, args...).CombinedOutput()
+	return string(out), err
+}
 
 // gitOutput runs `git <args>` in dir and returns combined output. A non-zero
 // exit returns the output plus the error so callers can surface git's message.
@@ -2340,7 +2851,7 @@ func (m *Model) completeSlash() {
 // cycle through the rest.
 func (m *Model) completeAtPath() {
 	value := m.input.Value()
-	at := strings.LastIndex(value, "@")
+	at := atTokenStart(value)
 	if at < 0 {
 		return
 	}
@@ -2367,14 +2878,10 @@ func (m *Model) completeAtPath() {
 		if len(hits) == 0 {
 			return
 		}
+		// Several matches are shown under the prompt by atCandidateLine while
+		// the cycle lasts, not printed: a line in scrollback outlives the
+		// moment it was useful for.
 		m.cycle = completeCycle{base: stem, hits: hits}
-		if len(hits) > 1 {
-			show := hits
-			if len(show) > 12 {
-				show = show[:12]
-			}
-			m.appendLine(bannerStyle.Render("candidates: " + strings.Join(show, "  ")))
-		}
 	}
 
 	chosen := m.cycle.hits[m.cycle.idx]
@@ -2469,17 +2976,15 @@ func commonPrefix(ss []string) string {
 	return p
 }
 
-// maxInputHistory caps the remembered prompts (ring buffer).
-const maxInputHistory = 200
-
 // pushHistory appends a submitted prompt (dropping an immediate duplicate) and
 // resets the navigation cursor to "not navigating".
 func (m *Model) pushHistory(prompt string) {
 	if n := len(m.inputHistory); n == 0 || m.inputHistory[n-1] != prompt {
 		m.inputHistory = append(m.inputHistory, prompt)
-		if len(m.inputHistory) > maxInputHistory {
-			m.inputHistory = m.inputHistory[len(m.inputHistory)-maxInputHistory:]
+		if len(m.inputHistory) > MaxInputHistory {
+			m.inputHistory = m.inputHistory[len(m.inputHistory)-MaxInputHistory:]
 		}
+		m.storePrompt(prompt)
 	}
 	m.histPos = len(m.inputHistory)
 	m.histDraft = ""
@@ -2487,6 +2992,10 @@ func (m *Model) pushHistory(prompt string) {
 
 // navigateHistory moves through prior prompts: up = older, down = newer. The
 // in-progress line is stashed on first up and restored past the newest entry.
+//
+// Going up leaves the cursor on the recalled entry's first line and going down
+// on its last, so a run of ↑ (or ↓) keeps browsing through multi-line entries
+// instead of stopping to walk the lines of each one (see historyKey).
 func (m *Model) navigateHistory(up bool) {
 	if len(m.inputHistory) == 0 {
 		return
@@ -2508,7 +3017,34 @@ func (m *Model) navigateHistory(up bool) {
 	} else {
 		m.input.SetValue(m.inputHistory[m.histPos])
 	}
-	m.input.CursorEnd()
+	m.syncInputHeight()
+	if up {
+		// SetValue leaves the cursor at the end; walk it back to the top. Each
+		// CursorUp moves one row, and the bound only guards against a widget
+		// that stops moving.
+		for i := 0; m.input.Line() > 0 && i < 10000; i++ {
+			m.input.CursorUp()
+		}
+		m.input.CursorStart()
+	} else {
+		m.input.CursorEnd()
+	}
+}
+
+// historyKey reports whether ↑/↓ should browse history rather than move the
+// cursor: ↑ with the cursor on the first row of the box, ↓ on the last
+// (readline's up-line-or-history). A single-row line browses either way, as it
+// always did; a multi-line entry recalled from history can be browsed past
+// instead of trapping the arrows inside it.
+func (m *Model) historyKey(msg tea.KeyMsg) bool {
+	if m.state != stateIdle || (msg.Type != tea.KeyUp && msg.Type != tea.KeyDown) {
+		return false
+	}
+	li := m.input.LineInfo()
+	if msg.Type == tea.KeyUp {
+		return m.input.Line() == 0 && li.RowOffset == 0
+	}
+	return m.input.Line() == m.input.LineCount()-1 && li.RowOffset+1 >= li.Height
 }
 
 // fmtDuration renders a turn duration compactly: "850ms", "12.3s", "2m05s".
@@ -2612,11 +3148,17 @@ func (m *Model) permissionSummary(req agent.ApprovalRequest) string {
 		}
 	case "Bash":
 		if desc := stringField(req.Input, "description"); desc != "" {
-			return "run command — " + desc
+			return "run command — " + visible(desc)
 		}
 		if target := firstNonEmpty(req.Specifier, stringField(req.Input, "command")); target != "" {
-			return "run command " + target
+			return "run command " + visible(target)
 		}
+	case "Memory":
+		// The only Memory call that asks is a write to KNOWLEDGE.md.
+		if name := stringField(req.Input, "name"); stringField(req.Input, "operation") == "promote" && name != "" {
+			return "promote memory note " + name + " to project knowledge (.klaudia/KNOWLEDGE.md)"
+		}
+		return "add to project knowledge (.klaudia/KNOWLEDGE.md)"
 	}
 	return label
 }
@@ -2625,7 +3167,31 @@ func (m *Model) permissionPrompt() string {
 	if hc := m.pendingReq.HostChange; hc != nil {
 		return hostPrompt(hc)
 	}
-	return fmt.Sprintf("Allow %s? (y)es once / (a)lways / (n)o", m.permissionSummary(m.pendingReq))
+	// No "always". Standing rules are gone: one in a config demoted the next
+	// session to a mode that asked about everything, so the answer offered to
+	// stop the prompting was the thing that caused more of it. Nothing
+	// built-in reaches this branch now — the host card above is the prompt
+	// users see — but an MCP server or an embedding frontend can still return
+	// Ask, and this is what they get.
+	return fmt.Sprintf("Allow %s? (y)es / (n)o / (s)omething else", m.permissionSummary(m.pendingReq))
+}
+
+// redirectAnswerLine echoes a "something else" answer. It invites the
+// instruction the user is about to type rather than announcing that Klaudia
+// will carry on without the action.
+const redirectAnswerLine = "declined — say what you'd like instead, and it lands before Klaudia's next step"
+
+// redirectDenial is the denial reason the model receives when the user answers
+// a permission ask with "something else": not only no, but that an instruction
+// is coming and it should wait for it rather than find another route to the
+// same end.
+func redirectDenial(host bool) string {
+	what := "The user declined this action"
+	if host {
+		what = "The user declined this change to their machine"
+	}
+	return what + " and is redirecting. Do not look for another way to do it. " +
+		"They are about to say what they want instead — wait for that instruction and follow it."
 }
 
 func permissionDetail(req agent.ApprovalRequest) string {
@@ -2642,7 +3208,16 @@ func permissionDetail(req agent.ApprovalRequest) string {
 		}
 	case "Bash":
 		if cmd := stringField(req.Input, "command"); cmd != "" {
-			return "command: " + oneline(cmd, 220)
+			return "command: " + visible(cmd)
+		}
+	case "Memory":
+		// Show what would be written: the point of asking is that the user
+		// reads the entry before every later session is primed with it.
+		if content := stringField(req.Input, "content"); content != "" {
+			return "note: " + oneline(content, 220) + "\n  loaded into every future session's prompt"
+		}
+		if stringField(req.Input, "operation") == "promote" {
+			return "copies the note's body into KNOWLEDGE.md, which is loaded into every future session's prompt"
 		}
 	}
 	if req.Suggestion != "" {
@@ -2686,30 +3261,102 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-// rememberPermission records a permission rule for the current UI session and,
-// when the project has a .klaudia directory, persists it to .klaudia/config.toml.
-func (m *Model) rememberPermission(kind string, rule permission.Rule) {
-	formatted := permission.FormatRule(rule)
-	verb := "allow"
-	if kind == "deny" {
-		verb = "deny"
-		m.sessionDeny = append(m.sessionDeny, rule)
-	} else {
-		m.sessionAllow = append(m.sessionAllow, rule)
+// showPermission puts one permission ask on screen. The caller has already
+// checked that nothing else is pending; a second ask goes on askQueue instead.
+func (m *Model) showPermission(msg permissionMsg) {
+	// A picker opened mid-turn would otherwise sit behind the prompt, with
+	// its keys answering the wrong question.
+	m.closeChoiceForPrompt()
+	m.rememberAskState()
+	m.setState(stateAwaitingPermission)
+	m.pending = msg.reply
+	m.pendingReq = msg.req
+	// A prompt stalls the turn until the user answers, so it is exactly the
+	// moment to get their attention if they have looked away.
+	m.notifyAttention("Klaudia needs permission")
+	if msg.req.HostChange != nil {
+		for _, line := range hostCardLines(msg.req.HostChange) {
+			m.appendLine(line)
+		}
+		return
 	}
+	summary := m.permissionSummary(msg.req)
+	if msg.req.Agent != "" {
+		summary = msg.req.Agent + " — " + summary
+	}
+	m.appendLine(askStyle.Render("Permission required: " + summary))
+	if detail := permissionDetail(msg.req); detail != "" {
+		m.appendLine(toolStyle.Render("  " + detail))
+	}
+	// The actionable prompt lives only in the persistent bottom view (see
+	// bottomView/stateAwaitingPermission) — don't duplicate it in scrollback.
+}
 
-	persisted := false
-	var err error
-	if m.sess != nil && m.sess.CWD != "" {
-		persisted, err = config.AppendProjectPermission(m.sess.CWD, kind, formatted)
+// showAsk puts one question on screen. Same rule as showPermission: the
+// caller has checked the screen is clear.
+func (m *Model) showAsk(msg askMsg) {
+	m.closeChoiceForPrompt()
+	m.rememberAskState()
+	m.setState(stateAwaitingAnswer)
+	m.askReply = msg.reply
+	m.askOptions = msg.options
+	m.askQuestion = msg.question
+	m.notifyAttention("Klaudia has a question")
+	m.appendLine(askStyle.Render("? " + msg.question))
+	for i, o := range msg.options {
+		line := fmt.Sprintf("  %d) %s", i+1, o.Label)
+		if o.Description != "" {
+			line += " — " + o.Description
+		}
+		m.appendLine(toolStyle.Render(line))
 	}
-	msg := fmt.Sprintf("  → always %s %s (this session)", verb, formatted)
-	if err != nil {
-		msg += "; config save failed: " + err.Error()
-	} else if persisted {
-		msg += "; saved to .klaudia/config.toml"
+	// Always last, always present: see otherAnswerLabel.
+	m.appendLine(hintStyle.Render(fmt.Sprintf("  %d) %s", len(msg.options)+1, otherAnswerLabel)))
+}
+
+// rememberAskState records the state to return to, but only for the first
+// ask of a run of them. A queued ask must not record stateAwaitingPermission
+// as the state to restore. Idle is recorded too: a background child asks
+// after the turn has ended, and answering it must not leave the TUI saying
+// it is running when nothing is.
+func (m *Model) rememberAskState() {
+	// stateAnsweringOther is excluded with the other awaiting states: an ask
+	// that arrives while the user is typing an "Other" answer would otherwise
+	// return there after the ask, with askReply already cleared.
+	if m.state != stateAwaitingPermission && m.state != stateAwaitingAnswer && m.state != stateAnsweringOther {
+		m.stateBeforeAsk = m.state
 	}
-	m.appendLine(toolStyle.Render(msg))
+}
+
+// showNextAsk draws the next queued ask whose caller is still waiting, and
+// returns to the state from before the asks when the queue runs out. A
+// queued ask whose context is done belongs to a child that was cancelled
+// while it waited, so showing it would ask the user a question nobody is
+// listening for the answer to.
+func (m *Model) showNextAsk() {
+	for len(m.askQueue) > 0 {
+		next := m.askQueue[0]
+		m.askQueue = m.askQueue[1:]
+		switch {
+		case next.permission != nil:
+			if next.permission.ctx != nil && next.permission.ctx.Err() != nil {
+				continue
+			}
+			m.showPermission(*next.permission)
+			return
+		case next.ask != nil:
+			if next.ask.ctx != nil && next.ask.ctx.Err() != nil {
+				continue
+			}
+			m.showAsk(*next.ask)
+			return
+		}
+	}
+	// The run of asks is over. Forget the recorded state so the next ask
+	// records its own: an ask during a turn records running, and a later
+	// ask while idle must not inherit it.
+	m.setState(m.stateBeforeAsk)
+	m.stateBeforeAsk = stateIdle
 }
 
 // answer resolves the pending permission ask.
@@ -2725,11 +3372,13 @@ func (m *Model) answer(d permission.Decision) {
 	// For a host change, say what the answer reached rather than just that one
 	// was given. "allowed" tells the user nothing about how far it went.
 	if hc := m.pendingReq.HostChange; hc != nil {
-		verb = hostAnswerLine(hc, d.Behavior == permission.Allow, m.hostRedirect)
+		verb = hostAnswerLine(hc, d.Behavior == permission.Allow, m.redirect)
+	} else if m.redirect {
+		verb = redirectAnswerLine
 	}
-	m.hostRedirect = false
+	m.redirect = false
 	m.appendLine(toolStyle.Render("  → " + verb))
-	m.setState(stateRunning)
+	m.showNextAsk()
 }
 
 // hostReportCount is the session's host-gate report count, or 0 when no gate is
@@ -2741,11 +3390,35 @@ func (m *Model) hostReportCount() int {
 	return len(m.sess.Trust.Reports())
 }
 
+// liveMode returns a source for the session's current permission mode, read at
+// each check rather than once per turn. Nil when there is no session (tests),
+// which leaves the caller's own permission context in place.
+func (m *Model) liveMode() func() permission.Mode {
+	if m.sess == nil {
+		return nil
+	}
+	sess := m.sess
+	return func() permission.Mode { return permission.Mode(sess.PermissionMode) }
+}
+
 // startTurn runs the agent in a goroutine, delivering events via the channel,
 // and returns the command that drives the spinner + elapsed stopwatch. The turn
 // runs under a cancellable context so Esc can interrupt it. A standing /goal is
 // re-stated to the model each turn (Ralph-style).
-func (m *Model) startTurn(prompt string) tea.Cmd {
+func (m *Model) startTurn(prompt string, images []tools.ResultImage) tea.Cmd {
+	// One turn at a time. Two agent goroutines would interleave events on the
+	// one channel and each overwrite the history with its own copy. Every
+	// caller is meant to reach here only when idle; this is the backstop for
+	// the one that isn't.
+	if m.turnInFlight {
+		m.appendLine(errStyle.Render("  a turn is already running — not starting another. Esc to interrupt it first."))
+		return nil
+	}
+	m.turnInFlight = true
+	// A turn in flight is the running state, whoever started it (/logs
+	// --errors used to start one while the UI stayed idle). settleState, not
+	// setState, so a picker open when a follow-up turn starts stays open.
+	m.settleState(stateRunning)
 	// Belt-and-braces: zero the per-turn live tally so a path that skipped
 	// doneMsg can't poison the next reconcile. The normal path also resets
 	// these on doneMsg, so this is just a guard.
@@ -2794,12 +3467,30 @@ func (m *Model) startTurn(prompt string) tea.Cmd {
 	planner := &uiPlanner{events: m.events}
 	emit := func(ev agent.Event) { m.events <- eventMsg{ev} }
 	ctx, cancel := context.WithCancel(m.ctx)
+	if m.loopGuard != nil && (m.loopRemaining > 0 || m.loopWrapUp) {
+		ctx = agent.WithCommandGuard(ctx, m.loopGuard)
+	}
 	m.turnCancel = cancel
+	turn := agent.Turn{
+		Prompt:     prompt,
+		Images:     images,
+		History:    m.history,
+		Emit:       emit,
+		Approver:   approver,
+		Asker:      asker,
+		Planner:    planner,
+		Interject:  m.steer.drain,
+		BeforeEdit: m.beforeEdit,
+		// Read live, every permission check: /mode bypass typed mid-turn, or
+		// ExitPlanMode being approved, has to reach the very next tool
+		// dispatch rather than waiting for the next turn boundary.
+		Mode: m.liveMode(),
+	}
 	go func() {
-		res, err := m.run(ctx, prompt, m.history, approver, asker, planner, emit, m.steer.drain, m.beforeEdit)
+		res, err := m.run(ctx, turn)
 		m.events <- doneMsg{res: res, err: err}
 	}()
-	return tea.Batch(m.spin.Tick, m.sw.Reset(), m.sw.Start())
+	return tea.Batch(m.sw.Reset(), m.sw.Start()) // the spinner is armed by syncSpinner
 }
 
 func (m *Model) renderEvent(ev agent.Event) {
@@ -2929,6 +3620,9 @@ func (m *Model) renderEvent(ev agent.Event) {
 		m.noteNav(kind, ev.ToolName+toolSummary(ev.ToolName, ev.Input)+" → "+oneline(s, 60), "", seq)
 		m.activeToolName = ""
 		m.phase = "thinking"
+	case "warning":
+		m.flushAssistant()
+		m.appendLine(errStyle.Render("⚠ " + ev.Content))
 	case "compaction":
 		m.flushAssistant()
 		if ev.Content == "" {
@@ -2943,6 +3637,23 @@ func (m *Model) renderEvent(ev agent.Event) {
 			m.appendLine(bannerStyle.Render("· " + ev.Content))
 			m.phase = "thinking"
 		}
+	case "notice":
+		// A system notice the user must actually see — something the model was
+		// told about but that leaves no visible trace of its own, like a web
+		// search that was dropped from the conversation. Not faint: the point
+		// of it is that the silence was the bug.
+		m.flushAssistant()
+		if ev.Content != "" {
+			m.appendLine(noticeStyle.Render("! " + ev.Content))
+			m.noteNav(navError, oneline(ev.Content, 60), "", 0)
+		}
+	case "background":
+		// A background sub-agent finished and its result was just handed to the
+		// model. A short banner so the user knows it landed; the full result is
+		// in the conversation the model is now responding to, and /agents shows
+		// per-agent status. Not the report itself — that can be long.
+		m.flushAssistant()
+		m.appendLine(bannerStyle.Render("· a background sub-agent finished — result delivered to Klaudia (/agents for status)"))
 	case "usage":
 		// One inner LLM call's usage. Update both the session counters and the
 		// per-turn tally so doneMsg's reconciliation knows what we already
@@ -3220,6 +3931,19 @@ func (m *Model) commit(b transcriptBlock) {
 // anyway; the difference is that these rows are now ours to clean up. The
 // transcript keeps the unwrapped text, so /copy and /export are unaffected.
 func (m *Model) fitScrollback(s string) string {
+	// Tabs are expanded here and nowhere earlier. Two bugs need it. A literal
+	// HT advances the cursor without painting the cells it skips, so a queued
+	// scrollback line written over the previous frame's rows leaves that
+	// frame's prompt border, placeholder and status bar showing through the
+	// indentation in 8- and 16-column runs. And ansi.StringWidth scores a tab
+	// as zero columns (HT is an ExecuteAction, not a PrintAction), so the
+	// measurement below would call a tab-heavy line short, skip the wrap, and
+	// hand the terminal a line it wraps onto rows we never erase.
+	//
+	// It happens at this choke point rather than in baseStyle so the two uses
+	// stay separable: m.transcript keeps the literal tabs, which is what /copy
+	// and /export read and the reason NoTabConversion is set at all.
+	s = expandTabs(s, tabStop)
 	limit := m.width - 1
 	if limit < 20 || s == "" {
 		return s
@@ -3236,6 +3960,47 @@ func (m *Model) fitScrollback(s string) string {
 		out = append(out, strings.Split(ansi.Hardwrap(line, limit, true), "\n")...)
 	}
 	return strings.Join(out, "\n")
+}
+
+// tabStop is the column interval the overwhelming majority of terminals use,
+// and the one the bleed runs in the original report measured.
+const tabStop = 8
+
+// expandTabs replaces each HT with spaces up to the next tab stop, counting
+// columns rather than bytes so the result lines up the way the terminal would
+// have. lipgloss's own expansion writes a fixed four spaces regardless of
+// column, which is what destroys the alignment of `go test` and kubectl output
+// and the reason baseStyle disables it.
+//
+// Columns are measured with ansi.StringWidth on the run before each tab: escape
+// sequences occupy no cells, and counting their bytes would push every later
+// tab on the line to the wrong stop.
+func expandTabs(s string, stop int) string {
+	if stop <= 0 || !strings.ContainsRune(s, '\t') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + stop)
+	for i, line := range strings.Split(s, "\n") {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		col := 0
+		for {
+			j := strings.IndexByte(line, '\t')
+			if j < 0 {
+				b.WriteString(line)
+				break
+			}
+			b.WriteString(line[:j])
+			col += ansi.StringWidth(line[:j])
+			pad := stop - col%stop
+			b.WriteString(strings.Repeat(" ", pad))
+			col += pad
+			line = line[j+1:]
+		}
+	}
+	return b.String()
 }
 
 // resize re-measures the live region. It deliberately does not reflow anything
@@ -3257,7 +4022,7 @@ func (m *Model) resize(w, h int) {
 }
 
 func (m *Model) introText() string {
-	return intro(m.introModel, m.introBranch, m.introTagline, skillNames(m.sess))
+	return intro(m.introModel, m.introBranch, m.introTagline, version.Get().Short(), skillNames(m.sess))
 }
 
 // View draws only the live region. Everything finished has already been printed
@@ -3276,6 +4041,9 @@ func (m *Model) View() string {
 	}
 	if m.pendingOSC != "" {
 		out, m.pendingOSC = m.pendingOSC+out, ""
+	}
+	if m.pendingNotify != "" {
+		out, m.pendingNotify = m.pendingNotify+out, ""
 	}
 	return out
 }
@@ -3376,7 +4144,9 @@ func (m *Model) bottomView() string {
 			bottom += "\n" + caption(m.renderQueuedHint())
 		}
 	case stateAwaitingPermission:
-		bottom = caption(askStyle.Render(m.permissionPrompt()))
+		// Esc here is not "no": it cancels the whole turn, a bigger answer than
+		// any of the listed ones, so it is named rather than left to discover.
+		bottom = caption(askStyle.Render(m.permissionPrompt()) + hintStyle.Render("  (esc cancels turn)"))
 	case stateAwaitingAnswer:
 		bottom = caption(askStyle.Render(fmt.Sprintf("Choose 1-%d", len(m.askOptions)+1)) +
 			hintStyle.Render(fmt.Sprintf("  (%d, or just start typing, to answer in your own words)", len(m.askOptions)+1)))
@@ -3389,12 +4159,16 @@ func (m *Model) bottomView() string {
 	case stateAwaitingConfirm:
 		bottom = caption(askStyle.Render("Confirm? (y)es / (n)o"))
 	case stateAwaitingChoice:
-		bottom = caption(askStyle.Render(fmt.Sprintf("Choose 1-%d", len(m.choiceItems))) + hintStyle.Render("  (esc to cancel)"))
+		bottom = m.choiceView()
 	default:
 		m.input.SetHeight(m.inputHeight())
 		bottom = m.promptBox()
-		if sug := m.slashSuggestionLine(); sug != "" {
+		if m.search.active {
+			bottom += "\n" + caption(m.searchLine())
+		} else if sug := m.slashSuggestionLine(); sug != "" {
 			bottom += "\n" + caption(sug)
+		} else if cand := m.atCandidateLine(); cand != "" {
+			bottom += "\n" + caption(cand)
 		}
 	}
 	// Persistent status bar at the very bottom, in every state.
@@ -3465,7 +4239,18 @@ func Run(ctx context.Context, run RunFunc, history []anthropic.BetaMessageParam,
 	// quit. Alt-screen would take all of those away (and would also make
 	// tea.Println a no-op), and mouse capture sets DECSET 1002, which is
 	// precisely what stops click-drag from selecting text.
-	p := tea.NewProgram(New(ctx, run, history, sess))
+	// Report focus (DECSET 1004) so the notifier can stay quiet while the window
+	// is focused. It is one of the few DECSETs that does not disturb inline
+	// rendering, scrollback or click-drag selection the way alt-screen and mouse
+	// capture would; a terminal that ignores it simply never sends focus events,
+	// and the notifier then fires regardless (see Model.focusKnown).
+	m := New(ctx, run, history, sess)
+	// Titles go to the program's output (tea.NewProgram's default), and only
+	// when that is a terminal. The terminal's own title comes back on exit.
+	out, restoreTitle := StartTitle(os.Stdout, term.IsTerminal(int(os.Stdout.Fd())), sess != nil && sess.NoTitle)
+	m.titleOut = out
+	defer restoreTitle() // deferred, so a panic out of the program still gives the title back
+	p := tea.NewProgram(m, tea.WithReportFocus())
 	defer quietStandardLogger()()
 	_, err := p.Run()
 	return err

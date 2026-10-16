@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/greenthread-ai/klaudia/internal/permission"
 )
@@ -33,6 +34,25 @@ type Result struct {
 	// it so the UI can still show everything the command actually printed;
 	// leaving it empty means Content is already complete.
 	Full string
+	// Child is what a sub-agent this result launched spent, so the parent loop
+	// can fold it into its own totals and budget check. Nil for every tool that
+	// does not launch one. A background launch has no usage yet — it reports
+	// through the registry when it finishes.
+	Child *ChildUsage
+}
+
+// ChildUsage is one sub-agent's spend, in the same units as the parent's
+// Result. Model is the model the child ran on, which the cost was priced for;
+// a parent that re-prices from its own model would get the wrong figure.
+type ChildUsage struct {
+	Model                    string
+	InputTokens              int64
+	OutputTokens             int64
+	CacheReadInputTokens     int64
+	CacheCreationInputTokens int64
+	APIDuration              time.Duration
+	CostUSD                  float64
+	NumTurns                 int
 }
 
 // Display returns the text a local frontend should show: the untruncated output
@@ -92,6 +112,67 @@ type Context struct {
 	// twenty minutes looked indistinguishable from a hang. It is a plain string
 	// callback rather than an event type because tools must not import agent.
 	Progress func(line string)
+	// Diagnostics, if non-nil, fetches language-server diagnostics for a file
+	// that was just written. Edit/Write call it after a successful write and
+	// append any new problems to their result, so the model immediately sees
+	// errors it just introduced. Nil — LSP disabled, or a caller that did not
+	// wire it — makes the append a no-op; it is backed by the LSP pool. A hook
+	// error or timeout appends nothing (never a false "clean").
+	Diagnostics DiagnosticsFunc
+	// Hidden, if non-nil, reports whether an absolute path is covered by a
+	// Read deny rule. Grep and Glob leave such paths out of what they walk,
+	// so a search started above a denied directory does not read into it.
+	Hidden func(abs string) bool
+	// ReadText, if non-nil, is where Read gets a text file instead of from
+	// disk: an absolute path, a 1-based start line and a line limit (0 for
+	// "all"), returning that window of the file.
+	//
+	// It exists for one frontend — ACP, where the editor serves the file and so
+	// hands back the user's *unsaved buffer*. Only Read consults it. Glob and
+	// Grep stay on disk: they walk a tree, and the protocol behind this hook is
+	// per-file, so routing them through it would mean asking the editor for
+	// every candidate.
+	ReadText func(ctx context.Context, path string, line, limit int) (string, error)
+	// Conversation identifies the conversation this call belongs to, for a
+	// frontend that runs more than one (ACP). The Agent tool tags a background
+	// launch with it so the result is delivered back to the same conversation;
+	// "" is the only conversation of every other frontend.
+	Conversation string
+
+	// The fields below are the launching turn's own state, captured so a child
+	// the Agent tool starts runs as the session is *now* rather than as it was
+	// when the process was wired. A child that kept the wiring-time approver
+	// could never ask the user anything, and one that kept the startup model
+	// ignored every /model and /mode change since. Only the Agent tool reads
+	// them; every other tool ignores them.
+	//
+	// Approver resolves a child's permission asks. It is an `any` because the
+	// approver type lives in agent, which imports this package — the concrete
+	// value is an agent.Approver, and the Agent tool type-asserts it.
+	Approver any
+	// Mode is the live permission mode function of the launching turn. A child
+	// holds the function, not a snapshot of its value, so a /mode change
+	// mid-run reaches the child too.
+	Mode func() permission.Mode
+	// Model is the launching turn's model id. "" means the caller did not
+	// know one, and the child keeps whatever model it was wired with.
+	Model string
+	// Effort and Thinking are the launching turn's reasoning settings
+	// (Options.Effort, Options.Thinking). "" means "send none".
+	Effort   string
+	Thinking string
+	// BeforeEdit is the launching turn's pre-edit checkpoint hook. A child
+	// that shares the parent's tree calls it before its own writes, and
+	// adoption of an isolated checkout calls it with the files it is about to
+	// apply, so a child's edits are visible to /undo the way the parent's are.
+	BeforeEdit func(tool string, paths []string)
+	// ExtraDirs are the session's additional working directories, so a child's
+	// prompt can name them the way the parent's does.
+	ExtraDirs []string
+	// Budget, when non-nil, is what is left of the launching turn's budget in
+	// USD after the parent's own spend so far. Nil means the turn has no
+	// budget; a pointer at 0 means it is already spent.
+	Budget *float64
 }
 
 // Tool is the contract implemented by every local tool (Read, Write, Bash, …).
@@ -113,14 +194,17 @@ type Tool interface {
 	// tool-specific rules, returning a human-readable error if invalid.
 	ValidateInput(raw json.RawMessage) error
 
-	// PermissionRequest derives the rule-matchable action (specifier) from raw
-	// input, e.g. the file path for Edit or the command line for Bash.
+	// PermissionRequest derives the action being requested from raw input, e.g.
+	// the file path for Edit or the command line for Bash. Nothing matches on
+	// it any more — the specifier is what a prompt shows the user.
 	PermissionRequest(raw json.RawMessage) permission.PermissionRequest
 
 	// CheckPermissions returns the tool's intrinsic permission decision for the
-	// current mode. It is consulted by permission.Check after deny/allow rules
-	// and the bypass short-circuit. Read-only tools allow; mutating tools ask
-	// (unless the mode auto-accepts).
+	// current mode. permission.Check consults it after the bypass
+	// short-circuit, and it is now the only thing that decides: plan mode
+	// denies anything that would leave a trace, every other mode allows.
+	// Host changes are stopped upstream by the gate in agent.dispatch, not
+	// here.
 	CheckPermissions(pctx permission.Context, req permission.PermissionRequest) permission.Decision
 
 	// Execute runs the tool and returns one or more tool_result blocks.

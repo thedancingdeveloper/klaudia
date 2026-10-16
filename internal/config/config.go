@@ -1,13 +1,19 @@
 // Package config loads Klaudia settings from .klaudia/config.toml — a project
-// .klaudia/ (in the working directory) overlaid on the user's ~/.klaudia/.
+// .klaudia/ (in the working directory) overlaid on the user's ~/.klaudia/
+// (or $KLAUDIA_CONFIG_DIR; see Root).
 // This selects the model provider/endpoint, e.g. an OpenAI-compatible cloud.
 package config
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -22,8 +28,13 @@ const (
 type Config struct {
 	// Provider selects the backend: "anthropic" (default) or "openai".
 	Provider string `toml:"provider,omitempty"`
-	// Model is the default model (e.g. "openai/gpt-5.5"); --model overrides it.
+	// Model is the default model (e.g. "sonnet", or "gpt-5.5" on an OpenAI-compatible
+	// endpoint, which receives it exactly as written); --model overrides it.
 	Model string `toml:"model,omitempty"`
+	// FallbackModel is tried when the model is overloaded (once, for that
+	// request) or not found (for the rest of the session); --fallback-model
+	// overrides it. "" means no fallback: the error ends the turn.
+	FallbackModel string `toml:"fallbackModel,omitempty"`
 	// Theme is the TUI theme for Markdown + chrome (e.g. "nord", "dracula").
 	// "" uses the default; /theme overrides it for the current session.
 	Theme string `toml:"theme,omitempty"`
@@ -41,27 +52,190 @@ type Config struct {
 	// "context length exceeded" errors deep into a session.
 	ContextWindow int `toml:"contextWindow,omitempty"`
 	// MaxTokens is the per-response output-token cap. 0 (unset) uses a
-	// model-aware default (api.MaxOutputTokens): capable Claude models get their
-	// real limit, unknown/OpenAI-compatible models a safe floor. Set this to
+	// model-aware default (api.MaxOutputTokensFor): Claude models on the
+	// Anthropic provider get their real limit; unknown models, and every model
+	// on another provider, a safe floor. Set this to
 	// raise or lower the cap explicitly — e.g. an OpenAI-compatible model whose
 	// output limit the table doesn't know.
 	MaxTokens int `toml:"maxTokens,omitempty"`
+	// Effort is the default reasoning effort: low | medium | high | xhigh | max.
+	// Unset sends none and the model uses its own default. Sent to Anthropic
+	// as output_config.effort and to OpenAI-compatible endpoints as
+	// reasoning_effort (xhigh and max become high there). --effort and
+	// /effort override it.
+	Effort string `toml:"effort,omitempty"`
+	// Thinking is "adaptive" or "disabled". Unset sends no thinking
+	// parameter, so each model runs its default (adaptive on Opus 5, Sonnet 5
+	// and Fable; off on Opus 4.8 and older). Anthropic provider only.
+	Thinking string `toml:"thinking,omitempty"`
 	// APIKey is the bearer token. Prefer APIKeyEnv to keep secrets out of files.
 	APIKey string `toml:"apiKey,omitempty"`
 	// APIKeyEnv names an environment variable holding the key.
 	APIKeyEnv string `toml:"apiKeyEnv,omitempty"`
+	// ExtraHeadersEnv maps an HTTP header name to the NAME of an environment variable
+	// holding its value (never a value in the file, mirroring apiKeyEnv). For
+	// OpenAI-compatible endpoints gated by non-bearer headers — e.g. a Cloudflare Access
+	// service token — set:
+	//   extraHeadersEnv = { "CF-Access-Client-Id" = "CF_ID", "CF-Access-Client-Secret" = "CF_SECRET" }
+	// The headers are applied to every request (alongside Authorization when a key is set).
+	ExtraHeadersEnv map[string]string `toml:"extraHeadersEnv,omitempty"`
 	// Sandbox configures how the Bash tool executes commands.
 	Sandbox Sandbox `toml:"sandbox,omitempty"`
 	// Browser configures local browser-backed tools (BrowserSearch/BrowserFetch and browser tools).
 	Browser Browser `toml:"browser,omitempty"`
 	// LSP configures language-server code-intelligence tools.
 	LSP LSP `toml:"lsp,omitempty"`
-	// Permissions holds persisted allow/deny rules for this project.
+	// Permissions holds the session's starting stance for this project.
 	Permissions Permissions `toml:"permissions,omitempty"`
-	// Trust configures the host-change guardrail.
-	Trust Trust `toml:"trust,omitempty"`
 	// Input configures the prompt's key handling.
 	Input Input `toml:"input,omitempty"`
+
+	// Warnings are Load's notes about settings it did not apply. They are
+	// never read from or written to a file.
+	Warnings []string `toml:"-"`
+	// Session configures how a launch picks up earlier sessions.
+	Session Session `toml:"session,omitempty"`
+	// Sessions configures on-disk session retention.
+	Sessions Sessions `toml:"sessions,omitempty"`
+	// TUI configures terminal-UI behaviour.
+	TUI TUI `toml:"tui,omitempty"`
+	// Subagents configures how sub-agents run.
+	Subagents Subagents `toml:"subagents,omitempty"`
+	// Hooks are lifecycle hooks: shell commands run at fixed points in a turn.
+	//
+	// Note that Load does NOT merge this field, and that is deliberate — see
+	// the comment on merge. Use LoadHooks, which keeps each hook attached to
+	// the file it came from.
+	Hooks []Hook `toml:"hooks,omitempty"`
+	// Banner configures the startup banner.
+	Banner Banner `toml:"banner,omitempty"`
+}
+
+// Hook is one `[[hooks]]` entry.
+//
+// This is the on-disk shape only. internal/hooks compiles it into something
+// runnable (the matcher becomes a regexp, the timeout a duration) and owns
+// every question about what the fields mean.
+type Hook struct {
+	// Event names the lifecycle point: SessionStart, UserPromptSubmit,
+	// PreToolUse or PostToolUse.
+	Event string `toml:"event"`
+	// Matcher is a regexp over the tool name, for the two tool events. Empty
+	// matches every tool.
+	Matcher string `toml:"matcher,omitempty"`
+	// Command is the shell command to run, as `sh -c` would take it.
+	Command string `toml:"command"`
+	// Timeout is a Go duration ("5s", "2m"). Empty uses the package default.
+	Timeout string `toml:"timeout,omitempty"`
+}
+
+// Subagents configures sub-agent execution.
+type Subagents struct {
+	// Worktree gives a sub-agent that can write its own git checkout, applied
+	// back to the working tree when it finishes. On by default: two children
+	// editing one tree both succeed at producing a mess, and the cost of a
+	// second checkout is a directory entry plus the uncommitted delta.
+	//
+	// A pointer so `worktree = false` is distinguishable from the field being
+	// absent — with a bool, turning the default off would be impossible.
+	//
+	// Turn it off for a working tree a second checkout cannot reproduce: one
+	// that needs an install step before anything runs, or whose build output
+	// is gitignored and expensive. A worktree starts from the parent's tracked
+	// and untracked files, never its ignored ones.
+	Worktree *bool `toml:"worktree,omitempty"`
+}
+
+// SubagentWorktrees resolves the default: on unless the config says otherwise.
+func (c Config) SubagentWorktrees() bool {
+	return c.Subagents.Worktree == nil || *c.Subagents.Worktree
+}
+
+// Sessions configures retention of stored session transcripts, pruned once at
+// startup. The active session is always kept.
+//
+// The two caps are independent: a session is pruned when it is older than the
+// age cap OR beyond the newest-N count cap. A zero (unset) field takes the
+// conservative default; a negative value disables that cap entirely.
+type Sessions struct {
+	// RetentionDays deletes sessions last modified more than N days ago.
+	// 0 (unset) uses the default of 30 days; a negative value disables the age cap.
+	RetentionDays int `toml:"retentionDays,omitempty"`
+	// RetentionMax keeps at most the N newest sessions.
+	// 0 (unset) uses the default of 100; a negative value disables the count cap.
+	RetentionMax int `toml:"retentionMax,omitempty"`
+}
+
+// Session configures session resume.
+type Session struct {
+	// AutoResumeMaxAge is how long after its last activity a session is still
+	// picked up implicitly by an interactive launch: a Go duration ("24h",
+	// "90m") or whole days ("7d"). "0" turns the cutoff off. Unset means
+	// DefaultAutoResumeMaxAge. It does not affect --continue or --resume,
+	// which name the session they want.
+	AutoResumeMaxAge string `toml:"autoResumeMaxAge,omitempty"`
+}
+
+// DefaultAutoResumeMaxAge is the auto-resume staleness cutoff when
+// [session] autoResumeMaxAge is unset.
+const DefaultAutoResumeMaxAge = 24 * time.Hour
+
+// MaxAge returns the auto-resume staleness cutoff; 0 means no cutoff. An
+// unparseable or negative value returns DefaultAutoResumeMaxAge with an error
+// for the caller to report.
+func (s Session) MaxAge() (time.Duration, error) {
+	v := strings.TrimSpace(s.AutoResumeMaxAge)
+	if v == "" {
+		return DefaultAutoResumeMaxAge, nil
+	}
+	var d time.Duration
+	var err error
+	if days, ok := strings.CutSuffix(v, "d"); ok {
+		var n int
+		n, err = strconv.Atoi(days)
+		d = time.Duration(n) * 24 * time.Hour
+	} else {
+		d, err = time.ParseDuration(v)
+	}
+	if err != nil || d < 0 {
+		return DefaultAutoResumeMaxAge, fmt.Errorf("session.autoResumeMaxAge %q is not a duration like \"24h\", \"7d\" or \"0\"; using 24h", v)
+	}
+	return d, nil
+}
+
+// TUI configures the terminal UI.
+type TUI struct {
+	// Notify selects how Klaudia gets your attention when it needs you while you
+	// are looking elsewhere — a turn has finished, or a permission/approval
+	// prompt is waiting. It is a comma-separated list of mechanisms:
+	//
+	//   "bell"   — the terminal bell (\a); the most widely supported.
+	//   "osc9"   — an OSC 9 desktop notification (iTerm2, kitty, WezTerm, …).
+	//   "osc777" — an OSC 777 desktop notification (rxvt/urxvt and others).
+	//
+	// "all" enables every mechanism; "off"/"none"/"false" stays silent. Unset
+	// defaults to "bell", the least intrusive and most portable choice. When
+	// the terminal reports focus, the notification is emitted only while the
+	// window is unfocused.
+	Notify string `toml:"notify,omitempty"`
+
+	// Cursor is "steady" (default) or "blink". A blinking cursor repaints the
+	// input about twice a second for as long as the prompt waits, so an idle
+	// session never stops writing to its terminal; steady keeps it silent.
+	// KLAUDIA_CURSOR_BLINK=1 (or 0) overrides this.
+	Cursor string `toml:"cursor,omitempty"`
+
+	// Title is "on" (default) or "off". On, Klaudia sets the terminal title to
+	// its state — "klaudia: ready", "klaudia: working", … — whenever the state
+	// changes (docs/embedding.md lists the strings).
+	Title string `toml:"title,omitempty"`
+}
+
+// Banner configures the startup banner shown above the first prompt.
+type Banner struct {
+	// Tagline is "on" (default: a rotating subtitle after "✦ Klaudia") or "off" — for an
+	// embedding host that shows the terminal to its own users.
+	Tagline string `toml:"tagline,omitempty"`
 }
 
 // Input configures how the prompt treats the Return key.
@@ -78,27 +252,18 @@ type Input struct {
 	Enter string `toml:"enter,omitempty"`
 }
 
-// Permissions persists allow/deny rule strings (e.g. "Bash(git status:*)",
-// "Edit") loaded into the permission context at startup.
-// Trust configures the host-change guardrail: how Klaudia behaves when a tool
-// call would change the machine it is running on.
+// Permissions sets the session's starting stance.
 //
-// This reads command lines and tool inputs. It is a guardrail against
-// well-intentioned mistakes, not a security boundary — see [Sandbox] for the
-// setting that is actually enforced by the kernel.
-type Trust struct {
-	// Mode is "enforce" (default), "observe" (classify and report, change no
-	// decisions) or "off". Unset means enforce, except for a config that
-	// already has permission rules, which starts in observe.
-	Mode string `toml:"mode,omitempty"`
-}
-
+// There are no allow/deny rules here any more, and no [trust] section either.
+// Per-command rules were the model the host-change guardrail replaced, and the
+// guardrail has no posture to configure: it always classifies, and the way to
+// turn everything off is the mode that says so.
 type Permissions struct {
-	// Mode is the default permission mode when no --permission-mode flag is
-	// given: default | acceptEdits | bypassPermissions | plan | dontAsk.
-	Mode  string   `toml:"mode,omitempty"`
-	Allow []string `toml:"allow,omitempty"`
-	Deny  []string `toml:"deny,omitempty"`
+	// Mode is the starting permission mode when no --permission-mode flag is
+	// given: autonomous (default) | acceptEdits | plan | bypassPermissions.
+	// The retired default | dontAsk are accepted as deprecated aliases for
+	// autonomous (permission.Resolve).
+	Mode string `toml:"mode,omitempty"`
 }
 
 // Sandbox modes.
@@ -125,6 +290,20 @@ type Sandbox struct {
 	ReadOnly bool `toml:"readOnly,omitempty"`
 	// Network is the container's --network value (e.g. "none" to isolate).
 	Network string `toml:"network,omitempty"`
+	// ReadCredentials lets commands under "os" confinement read the user's
+	// credentials (~/.ssh, ~/.aws, ~/.kube/config, …), which are hidden by
+	// default. Set it when commands in the sandbox need them — git over ssh,
+	// the aws or kubectl CLIs.
+	ReadCredentials bool `toml:"readCredentials,omitempty"`
+	// FailIfUnavailable refuses to start when the configured sandbox cannot
+	// be used, instead of warning and running commands unconfined.
+	FailIfUnavailable bool `toml:"failIfUnavailable,omitempty"`
+	// MemoryMax caps the memory one Bash command and everything it starts may
+	// use, e.g. "4G" or "512M" (K/M/G/T are powers of 1024). Empty means no
+	// limit. On Linux it is a cgroup made through `systemd-run --user --scope`;
+	// in container mode it is the container's --memory. Where it cannot be
+	// enforced Klaudia warns at startup and runs commands without it.
+	MemoryMax string `toml:"memoryMax,omitempty"`
 }
 
 // Browser engines.
@@ -142,7 +321,7 @@ type Browser struct {
 	ChromePath string `toml:"chromePath,omitempty"`
 	// RemoteURL attaches to an existing Chrome DevTools endpoint instead of launching.
 	RemoteURL string `toml:"remoteUrl,omitempty"`
-	// UserDataDir stores Chrome profile state/cookies. Defaults to ~/.klaudia/browser/chrome-profile.
+	// UserDataDir stores Chrome profile state/cookies. Defaults to browser/chrome-profile under Root (~/.klaudia).
 	UserDataDir string `toml:"userDataDir,omitempty"`
 	// HeadedFallback relaunches headed Chrome for user-assisted search challenge handling.
 	HeadedFallback *bool `toml:"headedFallback,omitempty"`
@@ -181,39 +360,6 @@ func ProjectDirExists(cwd string) bool {
 	return err == nil && st.IsDir()
 }
 
-// AppendProjectPermission appends rule to cwd/.klaudia/config.toml under
-// permissions.allow or permissions.deny. It is a no-op when cwd/.klaudia does
-// not exist, so users opt into project-local persistence by creating the folder.
-func AppendProjectPermission(cwd, kind, rule string) (bool, error) {
-	if !ProjectDirExists(cwd) {
-		return false, nil
-	}
-	path := ProjectPath(cwd)
-	cfg, err := readProject(path)
-	if err != nil {
-		return false, err
-	}
-	switch kind {
-	case "allow":
-		if contains(cfg.Permissions.Allow, rule) {
-			return true, nil
-		}
-		cfg.Permissions.Allow = append(cfg.Permissions.Allow, rule)
-	case "deny":
-		if contains(cfg.Permissions.Deny, rule) {
-			return true, nil
-		}
-		cfg.Permissions.Deny = append(cfg.Permissions.Deny, rule)
-	default:
-		return false, errors.New("permission kind must be allow or deny")
-	}
-	data, err := toml.Marshal(cfg)
-	if err != nil {
-		return false, err
-	}
-	return true, os.WriteFile(path, data, 0o644)
-}
-
 func contains(ss []string, s string) bool {
 	for _, v := range ss {
 		if v == s {
@@ -223,47 +369,163 @@ func contains(ss []string, s string) bool {
 	return false
 }
 
-// Load reads ~/.klaudia/config.toml then overlays ./.klaudia/config.toml
-// (project settings win). Missing files are ignored.
-func Load(cwd string) Config {
+// LoadHome reads only the global config (GlobalPath: ~/.klaudia/config.toml,
+// or $KLAUDIA_CONFIG_DIR/config.toml): the project's file is not read at all.
+// Used by --safe-mode.
+func LoadHome() (Config, error) {
 	var cfg Config
-	if home, err := os.UserHomeDir(); err == nil {
-		merge(&cfg, read(filepath.Join(home, ".klaudia", "config.toml")))
+	if p := GlobalPath(); p != "" {
+		c, warn, err := read(p)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Warnings = append(cfg.Warnings, warn...)
+		merge(&cfg, c)
 	}
-	merge(&cfg, read(ProjectPath(cwd)))
-	return cfg
+	return cfg, nil
 }
 
-func read(path string) Config {
-	c, _ := readProject(path)
-	return c
+// Load reads ~/.klaudia/config.toml then overlays ./.klaudia/config.toml
+// (project settings win). Missing files are ignored. In a folder that is not
+// on the trust list, the project file's security-relevant keys are withheld
+// (see withholdUntrusted) and named in Warnings.
+//
+// A file that cannot be read or does not parse is an error naming the file and,
+// where the parser knows it, the line and column: a broken config must not
+// start a session on some other configuration. A key the schema does not know
+// is not an error — it is skipped and named, with its file and line, in
+// Warnings.
+func Load(cwd string) (Config, error) {
+	return LoadTrusting(cwd, IsTrustedProject(cwd))
 }
 
-func readProject(path string) (Config, error) {
+// HookSources is the hook configuration with its provenance intact.
+type HookSources struct {
+	// User came from ~/.klaudia/config.toml: the user's own machine, written by
+	// the person running Klaudia.
+	User []Hook
+	// Project came from ./.klaudia/config.toml, which arrives with the repo. A
+	// clone can carry hooks its author chose, so these are not the same kind of
+	// instruction as the ones above and callers must not treat them as such.
+	Project []Hook
+	// ProjectPath is the file Project was read from, for a prompt that can name
+	// what it is asking about.
+	ProjectPath string
+}
+
+// LoadHooks reads the hook entries from both config files without merging them.
+//
+// Everything else in Config is a setting, and the only question about a setting
+// is which value wins. A hook is a command that will be executed, so where it
+// came from is part of what it is: the trust decision in internal/hooks needs
+// the project's hooks separable from the user's, and a merged slice cannot
+// answer that.
+func LoadHooks(cwd string) HookSources {
+	src := HookSources{ProjectPath: ProjectPath(cwd)}
+	if home, err := os.UserHomeDir(); err == nil {
+		src.User = readHooks(filepath.Join(home, ".klaudia", "config.toml"))
+	}
+	src.Project = readHooks(src.ProjectPath)
+	return src
+}
+
+// readHooks returns the [[hooks]] entries of the file at path; a missing or
+// unreadable file has none (Load reports a broken file).
+func readHooks(path string) []Hook {
+	c, _, err := read(path)
+	if err != nil {
+		return nil
+	}
+	return c.Hooks
+}
+
+// LoadTrusting is Load with the project's trust decided by the caller. A
+// launcher that writes ./.klaudia/config.toml itself — an embedder rendering
+// a per-session config — passes true (--trusted-project-config), since the
+// file is its own and not the checkout's.
+func LoadTrusting(cwd string, trusted bool) (Config, error) {
+	cfg, err := LoadHome()
+	if err != nil {
+		return Config{}, err
+	}
+	proj, warn, err := read(ProjectPath(cwd))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Warnings = append(cfg.Warnings, warn...)
+	if !trusted {
+		if held := withholdUntrusted(&proj); len(held) > 0 {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"%s: this folder is not trusted, so these settings were ignored: %s. "+
+					"Review the file, then run `klaudia --trust-project` here to apply them.",
+				ProjectPath(cwd), strings.Join(held, ", ")))
+		}
+	}
+	merge(&cfg, proj)
+	return cfg, nil
+}
+
+// read decodes the config file at path. A missing or blank file is an empty
+// Config. Unknown keys come back as warnings; the known keys still apply.
+func read(path string) (Config, []string, error) {
 	var c Config
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return c, nil
+			return c, nil, nil
 		}
-		return c, err
+		return c, nil, fmt.Errorf("read config: %w", err)
 	}
 	if strings.TrimSpace(string(data)) == "" {
-		return c, nil
+		return c, nil, nil
 	}
-	if err := toml.Unmarshal(data, &c); err != nil {
-		return c, err
+	err = toml.NewDecoder(bytes.NewReader(data)).DisallowUnknownFields().Decode(&c)
+	var strict *toml.StrictMissingError
+	if errors.As(err, &strict) {
+		// Strict mode still decodes every known key; it only reports the rest.
+		warn := make([]string, 0, len(strict.Errors))
+		for i := range strict.Errors {
+			e := &strict.Errors[i]
+			line, _ := e.Position()
+			warn = append(warn, fmt.Sprintf("%s:%d: unknown key %q, ignored",
+				path, line, strings.Join(e.Key(), ".")))
+		}
+		return c, warn, nil
 	}
-	return c, nil
+	if err != nil {
+		return Config{}, nil, parseError(path, err)
+	}
+	return c, nil, nil
+}
+
+// parseError names the file, and the line and column when the decoder
+// reports them. Some go-toml errors (a duplicate key, an array where a string
+// belongs) carry no position; those name the file alone.
+func parseError(path string, err error) error {
+	msg := strings.TrimPrefix(err.Error(), "toml: ")
+	var de *toml.DecodeError
+	if errors.As(err, &de) {
+		line, col := de.Position()
+		return fmt.Errorf("%s:%d:%d: %s", path, line, col, msg)
+	}
+	return fmt.Errorf("%s: %s", path, msg)
 }
 
 // merge overlays non-empty fields of src onto dst.
+//
+// Hooks are left out on purpose. Merging them would produce one slice in which
+// a command from the repo is indistinguishable from a command the user wrote,
+// and the only safe thing to do with such a slice is refuse to run any of it.
+// LoadHooks is the accessor.
 func merge(dst *Config, src Config) {
 	if src.Provider != "" {
 		dst.Provider = src.Provider
 	}
 	if src.Model != "" {
 		dst.Model = src.Model
+	}
+	if src.FallbackModel != "" {
+		dst.FallbackModel = src.FallbackModel
 	}
 	if src.Theme != "" {
 		dst.Theme = src.Theme
@@ -277,6 +539,15 @@ func merge(dst *Config, src Config) {
 	if src.APIKeyEnv != "" {
 		dst.APIKeyEnv = src.APIKeyEnv
 	}
+	// Extra headers overlay per key (project over home), rather than replacing wholesale.
+	if len(src.ExtraHeadersEnv) > 0 {
+		if dst.ExtraHeadersEnv == nil {
+			dst.ExtraHeadersEnv = make(map[string]string, len(src.ExtraHeadersEnv))
+		}
+		for header, envVar := range src.ExtraHeadersEnv {
+			dst.ExtraHeadersEnv[header] = envVar
+		}
+	}
 	if src.Temperature != nil {
 		dst.Temperature = src.Temperature
 	}
@@ -285,6 +556,12 @@ func merge(dst *Config, src Config) {
 	}
 	if src.MaxTokens != 0 {
 		dst.MaxTokens = src.MaxTokens
+	}
+	if src.Effort != "" {
+		dst.Effort = src.Effort
+	}
+	if src.Thinking != "" {
+		dst.Thinking = src.Thinking
 	}
 	if src.Sandbox.Mode != "" {
 		dst.Sandbox.Mode = src.Sandbox.Mode
@@ -303,6 +580,15 @@ func merge(dst *Config, src Config) {
 	}
 	if src.Sandbox.Network != "" {
 		dst.Sandbox.Network = src.Sandbox.Network
+	}
+	if src.Sandbox.ReadCredentials {
+		dst.Sandbox.ReadCredentials = true
+	}
+	if src.Sandbox.FailIfUnavailable {
+		dst.Sandbox.FailIfUnavailable = true
+	}
+	if src.Sandbox.MemoryMax != "" {
+		dst.Sandbox.MemoryMax = src.Sandbox.MemoryMax
 	}
 	if len(src.Sandbox.WriteRoots) > 0 {
 		dst.Sandbox.WriteRoots = append(dst.Sandbox.WriteRoots, src.Sandbox.WriteRoots...)
@@ -332,11 +618,35 @@ func merge(dst *Config, src Config) {
 	if src.Permissions.Mode != "" {
 		dst.Permissions.Mode = src.Permissions.Mode
 	}
-	// Permission rules accumulate (home rules + project rules).
-	dst.Permissions.Allow = append(dst.Permissions.Allow, src.Permissions.Allow...)
-	dst.Permissions.Deny = append(dst.Permissions.Deny, src.Permissions.Deny...)
-	if src.Trust.Mode != "" {
-		dst.Trust.Mode = src.Trust.Mode
+	if src.Subagents.Worktree != nil {
+		dst.Subagents.Worktree = src.Subagents.Worktree
+	}
+	if src.Input.Enter != "" {
+		dst.Input.Enter = src.Input.Enter
+	}
+	if src.Session.AutoResumeMaxAge != "" {
+		dst.Session.AutoResumeMaxAge = src.Session.AutoResumeMaxAge
+	}
+	if src.TUI.Notify != "" {
+		dst.TUI.Notify = src.TUI.Notify
+	}
+	if src.TUI.Cursor != "" {
+		dst.TUI.Cursor = src.TUI.Cursor
+	}
+	if src.TUI.Title != "" {
+		dst.TUI.Title = src.TUI.Title
+	}
+	// Session retention: project overrides home. 0 means unset (keep the
+	// default), so only a non-zero value — including a negative "disable" —
+	// carries over.
+	if src.Sessions.RetentionDays != 0 {
+		dst.Sessions.RetentionDays = src.Sessions.RetentionDays
+	}
+	if src.Sessions.RetentionMax != 0 {
+		dst.Sessions.RetentionMax = src.Sessions.RetentionMax
+	}
+	if src.Banner.Tagline != "" {
+		dst.Banner.Tagline = src.Banner.Tagline
 	}
 	// Disabled LSP languages accumulate (union of home + project).
 	dst.LSP.Disabled = append(dst.LSP.Disabled, src.LSP.Disabled...)
@@ -351,4 +661,25 @@ func (c Config) ResolveAPIKey() string {
 		return strings.TrimSpace(os.Getenv(c.APIKeyEnv))
 	}
 	return ""
+}
+
+// ResolveExtraHeaders resolves ExtraHeadersEnv (header -> env var NAME) to concrete header
+// values by reading each named environment variable. It returns the resolved headers and the
+// sorted NAMES of any referenced variables that are unset/empty (names only, never values).
+func (c Config) ResolveExtraHeaders() (map[string]string, []string) {
+	if len(c.ExtraHeadersEnv) == 0 {
+		return nil, nil
+	}
+	headers := make(map[string]string, len(c.ExtraHeadersEnv))
+	var missing []string
+	for header, envVar := range c.ExtraHeadersEnv {
+		val := strings.TrimSpace(os.Getenv(envVar))
+		if val == "" {
+			missing = append(missing, envVar)
+			continue
+		}
+		headers[header] = val
+	}
+	sort.Strings(missing)
+	return headers, missing
 }

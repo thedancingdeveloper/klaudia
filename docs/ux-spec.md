@@ -26,6 +26,7 @@ of the spec. Each was a decision, not an oversight.
 | §17: undo | Git blob checkpoints, never the index or a stash | A stash moves the *whole* working tree including the user's unrelated edits. |
 | §19: "Jobs: local #1 postgres running" on resume | Jobs are always reported as **stopped** | They were children of a process that exited. Reporting them as running would be a lie the moment it was written. |
 | §20: `klaudia review --json` subcommand | `-p "…" --output-format json` | The existing flag already does it; a subcommand would be a second way to say the same thing. |
+| Claude Code parity: `claude "prompt"` opens the TUI with that prompt | `klaudia "prompt"` is shorthand for `-p "prompt"`: it runs headless and exits | Intentional: a positional prompt is how scripts call Klaudia, and a script has no one to drive a TUI. The interactive TUI is `klaudia` with no prompt. |
 
 ## Phase 1 — Don't break my terminal
 
@@ -50,6 +51,32 @@ OSC 52 with glamour's document padding stripped at commit time, long output
 recoverable through `$PAGER`, and a two-press Ctrl+C so a reflexive "stop the
 running thing" cannot destroy the session.
 
+**`@file` references (`atfile.go`).** Tab-completing `@path` (see the
+completion note above) inserts a short token; at *submit* time — not while
+typing, so the transcript stays readable — the token is expanded into what the
+model actually receives:
+
+- `@path` — the whole text file, inlined behind a `===== path =====` delimiter.
+- `@path:START-END` — lines START..END, 1-based and inclusive. `@path:LINE` is
+  the single-line case. The colon form is the one compilers and stack traces
+  already print; a range only adds the `-END` half, and an END past the file is
+  clamped rather than refused.
+- `@image.{png,jpg,jpeg,gif,webp}` — attached as a base64 image content block on
+  the user message (the same block shape a Read of an image produces), not
+  dumped as bytes. Pasting or typing a path to a saved screenshot is how a
+  pasted image is attached.
+
+A token that does not resolve to a real file is left exactly as typed —
+existence is the disambiguator, so `@handle` and an email survive — but a token
+that plainly meant a file (a slash or an extension) and is missing earns a note.
+Bounds keep the request sane: a whole-file text reference over 256 KiB, an image
+over 5 MiB, and a non-image binary are each refused with a faint note in the
+terminal (never sent to the model). Expansion runs on the first submit and on a
+message queued while Klaudia is working; a mid-turn steering interjection is
+text-only, and clipboard-image paste (bytes straight off the system clipboard,
+without a file) is a deliberate follow-up rather than something a v1 bubbletea
+paste event exposes.
+
 ## Phase 2 — Agent loop, shell integration and trust
 
 ### §1–8 Trust — [docs/trust.md](trust.md)
@@ -63,7 +90,8 @@ declares what it intends to change and why, and the package install, config
 write, validate and restart that follow all proceed. Approvals are
 session-scoped, never written to disk, and there is no always-allow.
 
-Modes collapsed from six to three (autonomous, plan, bypass). Autonomous is
+Modes collapsed from six to three (autonomous, plan, bypass); `acceptEdits`
+later came back as a fourth (WI-1272, see trust.md). Autonomous is
 refused unless the guardrail is enforcing — without it, it would be
 `bypassPermissions` under a friendlier name.
 

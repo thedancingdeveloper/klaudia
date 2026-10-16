@@ -36,7 +36,7 @@ func startTestServer(t *testing.T) (*Manager, func()) {
 	if err != nil {
 		t.Fatalf("server connect: %v", err)
 	}
-	server, err := ConnectTransport(ctx, "testsrv", clientT)
+	server, err := ConnectTransport(ctx, "testsrv", clientT, nil)
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
 	}
@@ -97,6 +97,75 @@ func TestLoadConfigParsesHTTPServer(t *testing.T) {
 	}
 	if l := cfg.MCPServers["local"]; l.Command != "my-server" || len(l.Args) != 1 {
 		t.Errorf("local = %+v", l)
+	}
+}
+
+func TestParseConfigArgInlineJSON(t *testing.T) {
+	cfg, err := ParseConfigArg(`{"mcpServers":{"inline":{"command":"my-server","args":["--stdio"]}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, ok := cfg.MCPServers["inline"]
+	if !ok || s.Command != "my-server" || len(s.Args) != 1 || s.Args[0] != "--stdio" {
+		t.Errorf("inline server = %+v (ok=%v)", s, ok)
+	}
+}
+
+func TestParseConfigArgFromPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "extra.json")
+	if err := os.WriteFile(path, []byte(`{
+		// a JSONC comment, tolerated as in on-disk configs
+		"mcpServers": {"remote": {"type": "http", "url": "https://mcp.example.com/v1"}}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := ParseConfigArg(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := cfg.MCPServers["remote"]; r.URL != "https://mcp.example.com/v1" || r.Type != "http" {
+		t.Errorf("remote = %+v", r)
+	}
+}
+
+func TestParseConfigArgErrors(t *testing.T) {
+	if _, err := ParseConfigArg(`{bad json`); err == nil {
+		t.Error("expected an error for malformed inline JSON")
+	}
+	if _, err := ParseConfigArg(filepath.Join(t.TempDir(), "does-not-exist.json")); err == nil {
+		t.Error("expected an error for a missing config path")
+	}
+	// Empty is a no-op, not an error: an unset repeatable flag yields "".
+	if cfg, err := ParseConfigArg("  "); err != nil || len(cfg.MCPServers) != 0 {
+		t.Errorf("empty arg: cfg=%+v err=%v", cfg, err)
+	}
+}
+
+func TestMerge(t *testing.T) {
+	base := Config{MCPServers: map[string]ServerConfig{
+		"keep":     {Command: "keep-server"},
+		"override": {Command: "base-server"},
+	}}
+	extra := Config{MCPServers: map[string]ServerConfig{
+		"override": {Command: "cli-server"}, // later source wins
+		"added":    {Command: "new-server"},
+	}}
+	got := Merge(base, extra)
+	if got.MCPServers["keep"].Command != "keep-server" {
+		t.Errorf("keep = %+v, want untouched", got.MCPServers["keep"])
+	}
+	if got.MCPServers["override"].Command != "cli-server" {
+		t.Errorf("override = %+v, want the extra (CLI) value to win", got.MCPServers["override"])
+	}
+	if got.MCPServers["added"].Command != "new-server" {
+		t.Errorf("added = %+v, want the extra server folded in", got.MCPServers["added"])
+	}
+
+	// Merge tolerates a nil base map (a Config built without the field set).
+	merged := Merge(Config{}, extra)
+	if len(merged.MCPServers) != 2 {
+		t.Errorf("merge into nil map = %+v", merged.MCPServers)
 	}
 }
 
@@ -188,7 +257,7 @@ func TestLoadConfigHandlesProjectDirEqualToConfigRoot(t *testing.T) {
 
 func TestConnectServerRejectsEmptyConfig(t *testing.T) {
 	// No command and no url → a clear error, without attempting any connection.
-	if _, err := connectServer(context.Background(), "bad", ServerConfig{}); err == nil {
+	if _, err := connectServer(context.Background(), "bad", ServerConfig{}, nil, nil); err == nil {
 		t.Error("expected error for a config with neither command nor url")
 	}
 }
@@ -305,7 +374,7 @@ func TestToolsCarryTheReadOnlyHint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("server connect: %v", err)
 	}
-	client, err := ConnectTransport(ctx, "annotated", clientT)
+	client, err := ConnectTransport(ctx, "annotated", clientT, nil)
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
 	}
@@ -376,7 +445,7 @@ func TestReadOnlyFalseRefusesToBelieveTheServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("server connect: %v", err)
 	}
-	client, err := ConnectTransport(ctx, "boastful", clientT)
+	client, err := ConnectTransport(ctx, "boastful", clientT, nil)
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
 	}

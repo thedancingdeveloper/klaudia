@@ -1,40 +1,44 @@
 package tools
 
-import "github.com/greenthread-ai/klaudia/internal/permission"
+import (
+	"path/filepath"
+	"strings"
 
-// editClassDecision is the intrinsic permission decision for file-mutating
-// tools (Write, Edit, NotebookEdit): auto-accepted under acceptEdits, blocked
-// in read-only plan mode, denied under dontAsk, otherwise ask. (bypass is
-// handled upstream by permission.Check.)
+	"github.com/greenthread-ai/klaudia/internal/permission"
+)
+
+// The intrinsic decisions below are what is left of per-tool permission once
+// zones took over. Two modes have something to say. Plan mode is read-only
+// exploration, so the three categories of side effect are each refused with a
+// message naming what was blocked. acceptEdits lets file edits in the
+// workspace through and asks about the other two categories, and about an edit
+// anywhere else. In autonomous everything runs.
+//
+// bypassPermissions never reaches here — permission.Check short-circuits it.
+// A change to this machine never reaches here either; agent.dispatch runs the
+// host gate first, and it does not consult the mode.
+
+// editClassDecision is the intrinsic decision for file-mutating tools
+// (Write, Edit, NotebookEdit).
 func editClassDecision(pctx permission.Context) permission.Decision {
-	switch permission.CurrentMode(pctx) {
-	case permission.ModeAutonomous, permission.ModeAcceptEdits:
-		return permission.Decision{Behavior: permission.Allow}
-	case permission.ModePlan:
+	if permission.CurrentMode(pctx) == permission.ModePlan {
 		return permission.Decision{Behavior: permission.Deny, Message: "plan mode is read-only; file modifications are not allowed"}
-	case permission.ModeDontAsk:
-		return permission.Decision{Behavior: permission.Deny, Message: "not pre-approved (dontAsk mode)"}
-	default:
-		return permission.Decision{Behavior: permission.Ask}
 	}
+	return permission.Decision{Behavior: permission.Allow}
 }
 
 // execClassDecision is the intrinsic decision for command-executing tools
-// (Bash): acceptEdits does NOT auto-accept execution, plan blocks it, dontAsk
-// denies, otherwise ask.
+// (Bash, RestartJob). Running commands is the job; what a command may reach is
+// decided by the host gate before this is consulted. acceptEdits is the one
+// mode that puts every command to the user — that is what it is for.
 func execClassDecision(pctx permission.Context) permission.Decision {
 	switch permission.CurrentMode(pctx) {
-	case permission.ModeAutonomous:
-		// Running commands is the job. What a command may reach is decided by
-		// the host gate before this is consulted, not by asking here.
-		return permission.Decision{Behavior: permission.Allow}
 	case permission.ModePlan:
 		return permission.Decision{Behavior: permission.Deny, Message: "plan mode is read-only; command execution is not allowed"}
-	case permission.ModeDontAsk:
-		return permission.Decision{Behavior: permission.Deny, Message: "not pre-approved (dontAsk mode)"}
-	default:
-		return permission.Decision{Behavior: permission.Ask}
+	case permission.ModeAcceptEdits:
+		return permission.Decision{Behavior: permission.Ask, Message: "acceptEdits mode asks before running a command"}
 	}
+	return permission.Decision{Behavior: permission.Allow}
 }
 
 // allowAlways is the intrinsic decision for read-only / side-effect-free tools
@@ -45,20 +49,97 @@ func allowAlways(permission.Context) permission.Decision {
 
 // networkClassDecision is the intrinsic decision for tools that reach the
 // network or drive a real browser with a persistent profile (BrowserSearch,
-// BrowserFetch, BrowserNavigate, BrowserSnapshot). These are NOT side-effect-free,
-// so they are blocked in read-only plan mode, denied under dontAsk, and
-// otherwise ask (acceptEdits does not auto-accept — that's only for file
-// edits). Users can pre-approve with an allow rule, e.g. /allow BrowserSearch.
+// BrowserFetch, BrowserNavigate, BrowserSnapshot). Fetching things is ordinary
+// work and changes nothing on this machine, but it is not side-effect-free, so
+// read-only plan mode still refuses it.
 func networkClassDecision(pctx permission.Context) permission.Decision {
 	switch permission.CurrentMode(pctx) {
-	case permission.ModeAutonomous:
-		// Fetching things is ordinary work and changes nothing on this machine.
-		return permission.Decision{Behavior: permission.Allow}
 	case permission.ModePlan:
 		return permission.Decision{Behavior: permission.Deny, Message: "plan mode is read-only; web/network access is not allowed"}
-	case permission.ModeDontAsk:
-		return permission.Decision{Behavior: permission.Deny, Message: "not pre-approved (dontAsk mode)"}
-	default:
-		return permission.Decision{Behavior: permission.Ask}
+	case permission.ModeAcceptEdits:
+		return permission.Decision{Behavior: permission.Ask, Message: "acceptEdits mode asks before web/network access"}
 	}
+	return permission.Decision{Behavior: permission.Allow}
+}
+
+// execGrantingDirs and execGrantingFiles are project paths whose contents run
+// later without anyone running them on purpose: git hooks and config (hooks,
+// fsmonitor, filter drivers), agent and editor config that launches servers or
+// tasks, and shell/package-manager rc files that execute on cd or install.
+// Writing one is how an edit becomes code execution, so they are asked about
+// even where edits are otherwise auto-accepted.
+var (
+	execGrantingDirs  = map[string]bool{".git": true, ".husky": true, ".klaudia": true, ".claude": true, ".devcontainer": true, ".vscode": true}
+	execGrantingFiles = map[string]bool{".mcp.json": true, ".envrc": true, ".npmrc": true, ".yarnrc": true, ".yarnrc.yml": true, ".pre-commit-config.yaml": true, "bunfig.toml": true, ".bazelrc": true}
+)
+
+// execGranting reports whether writing path would write one of those files. A
+// symlinked parent is resolved, so "hooks -> .git/hooks" is caught too.
+func execGranting(path string) bool {
+	if path == "" {
+		return false
+	}
+	candidates := []string{filepath.Clean(path)}
+	if real, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+		candidates = append(candidates, filepath.Join(real, filepath.Base(path)))
+	}
+	for _, p := range candidates {
+		if execGrantingFiles[filepath.Base(p)] {
+			return true
+		}
+		for _, part := range strings.Split(filepath.ToSlash(p), "/") {
+			if execGrantingDirs[part] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// editPathDecision is editClassDecision for a write to path: where edits are
+// auto-accepted, an exec-granting path is asked about instead. In acceptEdits
+// an edit outside the workspace is asked about too. Autonomous leaves that to
+// the host gate, which lets the rest of $HOME through as the user's own data;
+// acceptEdits is the narrower promise ("edits to this project"), as in Claude
+// Code.
+func editPathDecision(pctx permission.Context, path string) permission.Decision {
+	d := editClassDecision(pctx)
+	if d.Behavior != permission.Allow {
+		return d
+	}
+	if execGranting(path) {
+		return permission.Decision{Behavior: permission.Ask, Message: path + " can make code run later (hooks, tasks, server or shell config), so it is not auto-approved"}
+	}
+	if permission.CurrentMode(pctx) == permission.ModeAcceptEdits && !permission.PathInWorkspace(pctx, path) {
+		return permission.Decision{Behavior: permission.Ask, Message: path + " is outside the workspace; acceptEdits only auto-approves edits inside it"}
+	}
+	return d
+}
+
+// pathRequest is the permission request for a tool acting on path: the path
+// as written, which names the request when a frontend shows it.
+func pathRequest(path string) permission.PermissionRequest {
+	return permission.PermissionRequest{Specifier: path}
+}
+
+func firstNonEmptyPath(p, fallback string) string {
+	if p == "" {
+		return fallback
+	}
+	return p
+}
+
+// globBase is the directory at the front of a glob pattern, before the first
+// component with a glob character in it.
+func globBase(pattern string) string {
+	parts := strings.Split(filepath.ToSlash(pattern), "/")
+	for i, part := range parts {
+		if strings.ContainsAny(part, "*?[{") {
+			if i == 0 {
+				return "."
+			}
+			return filepath.FromSlash(strings.Join(parts[:i], "/") + "/")
+		}
+	}
+	return pattern
 }

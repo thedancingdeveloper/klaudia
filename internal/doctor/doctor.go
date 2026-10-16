@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/greenthread-ai/klaudia/internal/version"
 )
 
 // Status values for a Check.
@@ -21,23 +23,59 @@ const (
 
 // Check is one diagnostic line.
 type Check struct {
-	Name   string
-	Status string // StatusOK | StatusWarn | StatusInfo
-	Detail string
+	Name   string `json:"name"`
+	Status string `json:"status"` // StatusOK | StatusWarn | StatusInfo
+	Detail string `json:"detail"`
+}
+
+// Report is the machine-readable form of a diagnostic run: the checks plus a
+// single verdict a caller (e.g. CI) can branch on without re-deriving it from
+// the individual lines.
+type Report struct {
+	Checks []Check `json:"checks"`
+	// OK is false when a critical check failed — see Critical. It is the field
+	// a `klaudia doctor` exit code is derived from.
+	OK bool `json:"ok"`
+}
+
+// NewReport bundles checks with the OK verdict.
+func NewReport(checks []Check) Report {
+	return Report{Checks: checks, OK: !Critical(checks)}
+}
+
+// Critical reports whether the checks contain a failure serious enough that a
+// headless run should exit non-zero. Today that is exactly one condition: no
+// usable credential resolved (the "auth" check warns), because without one
+// Klaudia cannot reach a model at all — every other warning (a missing sandbox
+// binary, an unknown context window, no language servers) still leaves a
+// working session, so those stay advisory. Keeping the rule here, next to the
+// checks it inspects, means the CLI and any future caller share one definition
+// of "broken" rather than each guessing from status strings.
+func Critical(checks []Check) bool {
+	for _, c := range checks {
+		if c.Name == "auth" && c.Status == StatusWarn {
+			return true
+		}
+	}
+	return false
 }
 
 // Input carries facts the CLI already resolved, so doctor stays pure and
 // testable. doctor adds OS/binary detection itself.
 type Input struct {
-	Provider    string      // resolved provider ("anthropic" | "openai" | …)
-	Model       string      // resolved model id
-	SandboxMode string      // configured sandbox mode ("local" | "os" | "container")
-	ConfigFound bool        // a .klaudia/config.toml was loaded
-	AuthOK      bool        // a usable credential resolved
-	AuthKind    string      // "oauth" | "api-key" | "none"
-	MCPServers  int         // configured MCP server count
-	LSPServers  []LSPServer // detected language servers
-	Skills      []Skill     // user-defined skills loaded for this session
+	Provider    string // resolved provider ("anthropic" | "openai" | …)
+	Model       string // resolved model id
+	SandboxMode string // configured sandbox mode ("local" | "os" | "container")
+	ConfigFound bool   // a .klaudia/config.toml was loaded
+	AuthOK      bool   // a usable credential resolved
+	AuthKind    string // "oauth" | "api-key" | "none"
+	MCPServers  int    // configured MCP server count
+	// MCPLegacySSE names the configured servers still on the HTTP+SSE
+	// transport, deprecated by the MCP spec in favour of streamable HTTP.
+	MCPLegacySSE []string
+	LSPServers   []LSPServer // detected language servers
+	Skills       []Skill     // user-defined skills loaded for this session
+	Hooks        []Hook      // configured lifecycle hooks
 	// Context-window facts resolved by the CLI (api.ContextWindow). Zero limit
 	// means the model isn't in our table and no config override was set — we
 	// fall back to compaction's default at request time.
@@ -46,12 +84,16 @@ type Input struct {
 	// MissingLSPHints are actionable suggestions for languages present in the
 	// project but lacking a server (e.g. "install gopls for go support").
 	MissingLSPHints []string
+	// Build names the running binary's build (version.Info.Summary): the
+	// commit and whether the tree was dirty, so a report can tell a stale
+	// installed binary from the one just built.
+	Build string
 }
 
 // Skill is one loaded user-defined skill, for the /doctor report.
 type Skill struct {
 	Name  string // invocation name
-	Scope string // "project" | "user"
+	Scope string // "project" | "user" | "bundled"
 }
 
 // LSPServer is a detected language server for the /doctor report.
@@ -59,6 +101,22 @@ type LSPServer struct {
 	Name     string // binary, e.g. "gopls"
 	Language string // e.g. "go"
 	Version  string // best-effort, e.g. "v0.15.2"; "" if unknown
+}
+
+// Hook is one configured lifecycle hook, for the /doctor report.
+//
+// Flattened to strings here rather than importing internal/hooks, for the same
+// reason Skill is: doctor describes an environment and must not acquire a
+// dependency on the machinery it describes.
+type Hook struct {
+	Event   string // "PreToolUse", …
+	Matcher string // tool-name pattern; "" means every tool
+	Scope   string // "user" | "project"
+	// Dormant marks a hook that is configured but will not run: a project hook
+	// whose set has not been approved on this machine. Reported because the
+	// symptom is silence — the user wrote a formatter hook, nothing formats, and
+	// nothing in the transcript says the set is still waiting on a yes.
+	Dormant bool
 }
 
 // lookPath is indirected for testing.
@@ -71,6 +129,11 @@ func Run(in Input) []Check {
 		checks = append(checks, Check{Name: name, Status: status, Detail: detail})
 	}
 
+	build := in.Build
+	if build == "" {
+		build = "unknown"
+	}
+	add("version", StatusInfo, version.Version+" — build "+build)
 	add("platform", StatusInfo, runtime.GOOS+"/"+runtime.GOARCH)
 
 	// Skills are invisible when none are defined: with zero skills the Skill
@@ -81,11 +144,21 @@ func Run(in Input) []Check {
 		add("skills", StatusInfo, "none loaded (add .md files to .klaudia/skills or ~/.klaudia/skills)")
 	} else {
 		names := make([]string, 0, len(in.Skills))
+		onDisk := 0
 		for _, sk := range in.Skills {
 			names = append(names, sk.Name+" ("+sk.Scope+")")
+			if sk.Scope != "bundled" {
+				onDisk++
+			}
 		}
 		sort.Strings(names)
-		add("skills", StatusOK, strconv.Itoa(len(in.Skills))+" loaded: "+strings.Join(names, ", "))
+		detail := strconv.Itoa(len(in.Skills)) + " loaded: " + strings.Join(names, ", ")
+		// The bundled skills always load, so a non-zero count no longer shows
+		// that the user's own were found. Say so when none were.
+		if onDisk == 0 {
+			detail += "; none of your own (add .md files to .klaudia/skills or ~/.klaudia/skills)"
+		}
+		add("skills", StatusOK, detail)
 	}
 
 	// Authentication.
@@ -128,6 +201,10 @@ func Run(in Input) []Check {
 	// Sandbox: report on the configured mode's required backend.
 	checks = append(checks, sandboxCheck(in.SandboxMode))
 
+	// Hooks run shell commands around the model's work, so the report says what
+	// is attached where even when everything is healthy.
+	checks = append(checks, hooksCheck(in.Hooks))
+
 	// Container runtimes (informational, useful regardless of mode).
 	for _, rt := range []string{"docker", "podman"} {
 		if _, err := lookPath(rt); err == nil {
@@ -142,6 +219,15 @@ func Run(in Input) []Check {
 		add("mcp", StatusOK, fmt.Sprintf("%d server(s) configured", in.MCPServers))
 	} else {
 		add("mcp", StatusInfo, "no MCP servers configured")
+	}
+	// The legacy HTTP+SSE transport still works and is still supported here,
+	// but it is deprecated in the spec and servers drop it on their own
+	// schedule. The symptom when one does is a connect error with no hint that
+	// the fix is one word in .mcp.json.
+	if len(in.MCPLegacySSE) > 0 {
+		add("mcp:transport", StatusWarn, fmt.Sprintf(
+			"%s on the deprecated HTTP+SSE transport (drop `\"type\": \"sse\"` to use streamable HTTP)",
+			strings.Join(in.MCPLegacySSE, ", ")))
 	}
 
 	// LSP code-intel servers (detected, not downloaded): one line per language,
@@ -182,6 +268,47 @@ func formatTokens(n int) string {
 	default:
 		return fmt.Sprintf("%d", n)
 	}
+}
+
+// hooksCheck summarises the configured lifecycle hooks.
+//
+// Listed in configuration order and not sorted, unlike skills: hooks run in the
+// order they are declared, and a formatter before a linter is not the same
+// automation as the reverse, so the report shows the order that is in force.
+func hooksCheck(hs []Hook) Check {
+	if len(hs) == 0 {
+		return Check{"hooks", StatusInfo, "none configured (add [[hooks]] to .klaudia/config.toml)"}
+	}
+	var user, project, dormant int
+	labels := make([]string, 0, len(hs))
+	for _, h := range hs {
+		label := h.Event
+		if h.Matcher != "" {
+			label += "(" + h.Matcher + ")"
+		}
+		if h.Scope == "project" {
+			project++
+		} else {
+			user++
+		}
+		if h.Dormant {
+			dormant++
+		}
+		labels = append(labels, label)
+	}
+	scopes := make([]string, 0, 2)
+	if user > 0 {
+		scopes = append(scopes, fmt.Sprintf("%d user", user))
+	}
+	if project > 0 {
+		scopes = append(scopes, fmt.Sprintf("%d project", project))
+	}
+	detail := strings.Join(scopes, ", ") + ": " + strings.Join(labels, ", ")
+	if dormant > 0 {
+		return Check{"hooks", StatusWarn, detail + fmt.Sprintf(
+			" — %d from the project will not run until you confirm the set", dormant)}
+	}
+	return Check{"hooks", StatusOK, detail}
 }
 
 // sandboxCheck reports whether the backend required by the configured sandbox

@@ -2,11 +2,14 @@ package tools
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/greenthread-ai/klaudia/internal/session"
 )
 
 // A job's output goes to a file, not a slice.
@@ -18,16 +21,11 @@ import (
 // `/logs` able to hand the user's own $PAGER something real.
 
 // jobLogDir is where job logs live, alongside the existing output spills.
-func jobLogDir(session string) string {
-	base := os.Getenv("KLAUDIA_CONFIG_DIR")
-	if base == "" {
-		home, _ := os.UserHomeDir()
-		base = filepath.Join(home, ".klaudia")
+func jobLogDir(sess string) string {
+	if sess == "" {
+		sess = "default"
 	}
-	if session == "" {
-		session = "default"
-	}
-	return filepath.Join(base, "jobs", session)
+	return filepath.Join(session.ConfigRoot(), "jobs", sess)
 }
 
 // jobLog is an append-only log file with a byte cursor for incremental reads.
@@ -101,9 +99,11 @@ func (l *jobLog) ReadFrom(offset int64) (string, int64) {
 	if _, err := f.Seek(offset, 0); err != nil {
 		return "", size
 	}
+	// ReadFull, and a cursor advanced only past what was read: a single Read may
+	// return short, and reporting size then would skip the unread bytes forever.
 	buf := make([]byte, size-offset)
-	n, _ := f.Read(buf)
-	return string(buf[:n]), size
+	n, _ := io.ReadFull(f, buf)
+	return string(buf[:n]), offset + int64(n)
 }
 
 // Size is the number of bytes written so far.

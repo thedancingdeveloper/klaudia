@@ -24,19 +24,64 @@ const (
 )
 
 // SpecPath returns the goal-spec path for cwd and whether it already exists.
-// Preference order: ./PRD.md, then ./.klaudia/GOAL.md. When neither exists it
-// returns the default create path (.klaudia/GOAL.md) with found=false.
+// Preference order: ./.klaudia/GOAL.md, then ./PRD.md — but only when PRD.md
+// has the goal-spec shape (see IsGoalSpec). A PRD.md is a common name for a
+// product requirements document that was never written for the loop; adopting
+// one would point every iteration at it and write wrap-up summaries into it.
+// When neither qualifies it returns the default create path (.klaudia/GOAL.md)
+// with found=false.
 func SpecPath(cwd string) (path string, found bool) {
-	candidates := []string{
-		filepath.Join(cwd, "PRD.md"),
-		filepath.Join(cwd, ".klaudia", "GOAL.md"),
+	own := filepath.Join(cwd, ".klaudia", "GOAL.md")
+	if isFile(own) {
+		return own, true
 	}
-	for _, p := range candidates {
-		if info, err := os.Stat(p); err == nil && !info.IsDir() {
-			return p, true
+	if prd := filepath.Join(cwd, "PRD.md"); isFile(prd) {
+		if data, err := os.ReadFile(prd); err == nil && IsGoalSpec(string(data)) {
+			return prd, true
 		}
 	}
-	return candidates[1], false
+	return own, false
+}
+
+// IgnoredPRD returns ./PRD.md when it exists but SpecPath passed it over for
+// lacking the goal-spec shape, so a caller can say why the loop is not using
+// it. It returns ("", false) when there is no PRD.md or it was adopted.
+func IgnoredPRD(cwd string) (string, bool) {
+	if _, found := SpecPath(cwd); found {
+		return "", false // GOAL.md, or a PRD.md that qualified
+	}
+	if prd := filepath.Join(cwd, "PRD.md"); isFile(prd) {
+		return prd, true
+	}
+	return "", false
+}
+
+// IgnoredPRDNote explains why prd is not the goal spec.
+func IgnoredPRDNote(prd string) string {
+	return "Not using " + prd + " as the goal spec: it lacks an acceptance checklist (\"- [ ]\" items) " +
+		"or a Verify section. The loop keeps its spec in .klaudia/GOAL.md."
+}
+
+func isFile(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
+}
+
+// checklistItemPattern matches an acceptance-checklist line, ticked or not:
+// "- [ ] …", "* [x] …".
+var checklistItemPattern = regexp.MustCompile(`(?m)^\s*[-*]\s+\[[ xX]\]\s`)
+
+// verifyHeadingPattern matches the heading of the section that names the
+// command proving success: "## Verify", "### Verification".
+var verifyHeadingPattern = regexp.MustCompile(`(?im)^\s*#{1,6}\s+verif(y|ication)\b`)
+
+// IsGoalSpec reports whether text has the shape of a goal spec as Template and
+// FacilitatorPrompt lay it out: at least one acceptance-checklist item and a
+// Verify section. The loop's completion gate counts those checkboxes and its
+// iterations run that command, so a document without both gives the loop
+// nothing to drive toward.
+func IsGoalSpec(text string) bool {
+	return checklistItemPattern.MatchString(text) && verifyHeadingPattern.MatchString(text)
 }
 
 // Read returns the spec contents and its path. If no spec exists yet, text is ""
@@ -96,34 +141,140 @@ func FacilitatorPrompt(specPath, existing string) string {
 	return b.String()
 }
 
-// IterationPrompt is the fixed prompt fed on every loop iteration. It is
-// intentionally constant: progress accumulates in files and git history, not in
-// the conversation context (the Ralph principle).
-func IterationPrompt(specPath string) string {
-	return "You are autonomously iterating toward the goal defined in " + specPath + ".\n" +
+// RunMode selects how a loop run uses git. The zero value is the default for
+// code goals: a dedicated branch and a commit per iteration.
+type RunMode struct {
+	// NoBranch runs on the current branch instead of klaudia/goal-<slug>.
+	NoBranch bool
+	// NoCommit leaves each iteration's changes in the working tree instead of
+	// committing them; progress is tracked in the spec, not in commits. For
+	// goals whose output is an artifact — reports, packets, status files, often
+	// gitignored — rather than a diff to merge (#246).
+	NoCommit bool
+}
+
+// Artifact is the mode a spec's `mode: artifact` line selects.
+var Artifact = RunMode{NoBranch: true, NoCommit: true}
+
+// specModePattern matches a `mode: artifact` line — in YAML front matter or on
+// its own line in the body (optionally bold, as `**Mode:** artifact`).
+var specModePattern = regexp.MustCompile(`(?im)^\s*(?:\*\*)?mode(?::\*\*|\*\*:|:)\s*artifact\s*$`)
+
+// SpecMode returns the run mode the spec declares: Artifact for a
+// `mode: artifact` line, the zero (code) mode otherwise.
+func SpecMode(spec string) RunMode {
+	if specModePattern.MatchString(stripFences(spec)) {
+		return Artifact
+	}
+	return RunMode{}
+}
+
+// Merge returns m with every option set in o also set — flags add to what the
+// spec declares; neither can turn the other's option off.
+func (m RunMode) Merge(o RunMode) RunMode {
+	return RunMode{NoBranch: m.NoBranch || o.NoBranch, NoCommit: m.NoCommit || o.NoCommit}
+}
+
+// String names the mode for the start-of-run line.
+func (m RunMode) String() string {
+	switch {
+	case m.NoBranch && m.NoCommit:
+		return "artifact mode: no branch, no commits"
+	case m.NoBranch:
+		return "no branch"
+	case m.NoCommit:
+		return "no commits"
+	}
+	return ""
+}
+
+// stripFences drops fenced code blocks, so a spec that quotes `mode: artifact`
+// in an example does not switch itself.
+func stripFences(s string) string {
+	var b strings.Builder
+	in := false
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			in = !in
+			continue
+		}
+		if !in {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// IterationPrompt is the fixed prompt fed on every loop iteration of a code
+// goal. It is intentionally constant: progress accumulates in files and git
+// history, not in the conversation context (the Ralph principle).
+func IterationPrompt(specPath string) string { return IterationPromptFor(specPath, RunMode{}) }
+
+// IterationPromptFor is IterationPrompt for a run mode. Under NoCommit the
+// model leaves its work in the working tree and the spec is the only record of
+// progress.
+func IterationPromptFor(specPath string, m RunMode) string {
+	var b strings.Builder
+	b.WriteString("You are autonomously iterating toward the goal defined in " + specPath + ".\n" +
 		"Re-read " + specPath + " now to recall the objective, acceptance criteria, and the " +
 		"\"## Progress\" notes from earlier iterations. Then inspect the current state of the " +
 		"repository (git status, git log, and run the build and tests). " +
 		"Choose the SINGLE most valuable next step toward satisfying the acceptance criteria, " +
-		"implement it, verify it (build + tests, or the spec's Verify command), and commit your work " +
-		"with a clear message.\n\n" +
-		"Before ending the turn, update " + specPath + " and commit it: tick the checklist items you " +
+		"implement it, verify it (build + tests, or the spec's Verify command)")
+	if m.NoCommit {
+		b.WriteString(". Do NOT commit: this goal's output is the working tree itself (reports, " +
+			"generated files, status updates), and it is left uncommitted for a person to review.\n\n")
+	} else {
+		b.WriteString(", and commit your work with a clear message.\n\n")
+	}
+	b.WriteString("Uncommitted changes that were already in the working tree when the loop started are not " +
+		"yours: leave them exactly as they are, uncommitted. ")
+	if !m.NoCommit {
+		b.WriteString("Commit only your own work — `git add <the files you changed>`, never `git add -A`, " +
+			"`git add .`, `git add -u` or `git commit -a`. ")
+	}
+	b.WriteString("To undo a change of your own, edit it back, `git checkout -- <path>` only " +
+		"files you changed, or `git revert` your own commit. Never run `git checkout --`, " +
+		"`git restore`, `git reset --hard`, `git clean` or `git stash` over files you did not " +
+		"change — that destroys someone's work.\n\n")
+	b.WriteString("Before ending the turn, update " + specPath)
+	if !m.NoCommit {
+		b.WriteString(" and commit it")
+	}
+	b.WriteString(": tick the checklist items you " +
 		"verified, and maintain a short \"## Progress\" section recording what is done, what remains, " +
-		"and the single best next step — so the next run (or a person) can resume from the spec alone.\n\n" +
-		"If and only if EVERY acceptance criterion is satisfied and verification passes, reply with " +
+		"and the single best next step — so the next run (or a person) can resume from the spec alone.")
+	if m.NoCommit {
+		b.WriteString(" The loop judges progress by whether this section changes, so record each step there.")
+	}
+	b.WriteString("\n\nIf and only if EVERY acceptance criterion is satisfied and verification passes, reply with " +
 		"exactly " + CompleteToken + " on its own line and make no further changes. Otherwise, end " +
-		"your turn after committing this step."
+		"your turn after ")
+	if m.NoCommit {
+		b.WriteString("updating the spec.")
+	} else {
+		b.WriteString("committing this step.")
+	}
+	return b.String()
 }
 
 // WrapUpPrompt is run once when the loop stops without completing (iteration cap
 // or stall). It asks the model to record an honest end-of-run summary in the
 // spec — no new work — so the next run or a person can resume cleanly.
-func WrapUpPrompt(specPath string) string {
+func WrapUpPrompt(specPath string) string { return WrapUpPromptFor(specPath, RunMode{}) }
+
+// WrapUpPromptFor is WrapUpPrompt for a run mode.
+func WrapUpPromptFor(specPath string, m RunMode) string {
+	history, commit := "the recent git history", " Commit only that spec update."
+	if m.NoCommit {
+		history, commit = "the working tree", " Do not commit."
+	}
 	return "The goal loop is stopping before the goal is complete. Do NOT make code changes or " +
-		"start new work. Review " + specPath + " and the recent git history, then update " + specPath +
+		"start new work. Review " + specPath + " and " + history + ", then update " + specPath +
 		" so it reflects reality: tick the acceptance criteria that are genuinely done, and write a " +
 		"clear \"## Progress\" section summarising what was accomplished this run, what remains, any " +
-		"blockers, and the single best next step to resume. Commit only that spec update."
+		"blockers, and the single best next step to resume." + commit
 }
 
 // IsComplete reports whether an iteration's final text signals completion.
@@ -239,13 +390,22 @@ func normalizePhaseKey(s string) string {
 // list. Fixing the spec first means the mechanical CountUnchecked gate is then
 // trustworthy for the rest of the run.
 func StubFixPrompt(specPath string, missing []string) string {
+	return StubFixPromptFor(specPath, missing, RunMode{})
+}
+
+// StubFixPromptFor is StubFixPrompt for a run mode.
+func StubFixPromptFor(specPath string, missing []string, m RunMode) string {
 	list := strings.Join(missing, ", ")
+	commit := "commit only the spec update"
+	if m.NoCommit {
+		commit = "change nothing else (do not commit)"
+	}
 	return "Before iterating on the goal, the Progress tracker in " + specPath + " is incomplete. " +
 		"The spec body describes the following phases that are NOT yet listed as `- [ ]` items in the " +
 		"`## Progress` section: " + list + ".\n\n" +
 		"Open " + specPath + ", append a `- [ ] Phase N — <title>` line for each of those phases " +
-		"under `## Progress` (in spec order, with the same titles used in the body), and commit only " +
-		"the spec update. Do NOT start any other work — the next iteration handles that."
+		"under `## Progress` (in spec order, with the same titles used in the body), and " + commit +
+		". Do NOT start any other work — the next iteration handles that."
 }
 
 // VerificationPrompt is the final-review prompt that fires once when the loop

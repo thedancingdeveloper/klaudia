@@ -17,6 +17,12 @@ func write(t *testing.T, path, content string) {
 	}
 }
 
+// isolateHome points HOME at an empty directory. Load searches
+// ~/.claude/skills and ~/.klaudia/skills, so without this a test asserting on
+// counts or warnings is really asserting on the developer's home directory —
+// TestLoadDirWarnsOnSkillDirWithoutDefinition failed on a machine whose
+// ~/.claude/skills held a `synced` folder with no SKILL.md, which is a correct
+// warning about the wrong filesystem.
 func TestParseFrontmatterAndBody(t *testing.T) {
 	sk, err := parse([]byte("---\nname: review\ndescription: Review the diff\ntype: prompt\ntools: [Bash, Read]\n---\nReview this: $ARGUMENTS\n"), "review.md")
 	if err != nil {
@@ -30,6 +36,96 @@ func TestParseFrontmatterAndBody(t *testing.T) {
 	}
 	if sk.Body != "Review this: $ARGUMENTS" {
 		t.Errorf("body = %q", sk.Body)
+	}
+}
+
+func TestParseFrontmatterParityKeys(t *testing.T) {
+	sk, err := parse([]byte("---\nname: ship\ndescription: Ship it\nallowed-tools: [Bash, Read]\nargument-hint: <service> <env>\nmodel: sonnet\n---\nDeploy $1 to $2. $ARGUMENTS"), "/x/ship.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sk.Tools) != 2 || sk.Tools[0] != "Bash" || sk.Tools[1] != "Read" {
+		t.Errorf("allowed-tools = %v", sk.Tools)
+	}
+	if sk.ArgHint != "<service> <env>" {
+		t.Errorf("argument-hint = %q", sk.ArgHint)
+	}
+	if sk.Model != "sonnet" {
+		t.Errorf("model = %q", sk.Model)
+	}
+	if sk.Dir != "/x" {
+		t.Errorf("dir = %q, want /x", sk.Dir)
+	}
+}
+
+func TestAllowedToolsWinsOverLegacyTools(t *testing.T) {
+	// allowed-tools is the Claude Code spelling and takes precedence.
+	sk, err := parse([]byte("---\nname: x\nallowed-tools: [Read]\ntools: [Bash, Edit]\n---\nbody"), "x.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sk.Tools) != 1 || sk.Tools[0] != "Read" {
+		t.Errorf("allowed-tools should win, got %v", sk.Tools)
+	}
+	// And the legacy `tools` key still works on its own.
+	sk2, err := parse([]byte("---\nname: y\ntools: [Bash]\n---\nbody"), "y.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sk2.Tools) != 1 || sk2.Tools[0] != "Bash" {
+		t.Errorf("legacy tools alias broken, got %v", sk2.Tools)
+	}
+}
+
+func TestRenderPositionalArguments(t *testing.T) {
+	sk := Skill{Body: "Deploy $1 to $2 (all: $ARGUMENTS)"}
+	if got := sk.Render("api staging extra"); got != "Deploy api to staging (all: api staging extra)" {
+		t.Errorf("positional render = %q", got)
+	}
+	// A positional with no matching argument becomes empty, and multi-digit
+	// indices are not confused with single digits.
+	sk2 := Skill{Body: "one=$1 ten=$10 missing=$3"}
+	if got := sk2.Render("A B C D E F G H I J"); got != "one=A ten=J missing=C" {
+		t.Errorf("multi-digit render = %q", got)
+	}
+	// Using only positionals still consumes the args (no append).
+	sk3 := Skill{Body: "just $1"}
+	if got := sk3.Render("here there"); got != "just here" {
+		t.Errorf("positional-only render = %q", got)
+	}
+}
+
+func TestRenderBaseDirectory(t *testing.T) {
+	sk := Skill{Body: "Read $KLAUDIA_SKILL_DIR/template.md", Dir: "/home/u/.klaudia/skills/deploy"}
+	got := sk.Render("")
+	if !strings.Contains(got, "Read /home/u/.klaudia/skills/deploy/template.md") {
+		t.Errorf("skill dir not substituted in body: %q", got)
+	}
+	if !strings.Contains(got, "Skill base directory: /home/u/.klaudia/skills/deploy") {
+		t.Errorf("base directory preamble missing: %q", got)
+	}
+	// The ${...} spelling also works.
+	sk2 := Skill{Body: "cd ${KLAUDIA_SKILL_DIR}", Dir: "/d"}
+	if !strings.Contains(sk2.Render(""), "cd /d") {
+		t.Errorf("braced skill dir not substituted: %q", sk2.Render(""))
+	}
+}
+
+func TestLoadSetsSkillDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", t.TempDir())      // isolate from the real ~/.claude skills
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
+	skills := filepath.Join(dir, ".klaudia", "skills")
+	mustMkdir(t, filepath.Join(skills, "deploy"))
+	write(t, filepath.Join(skills, "deploy", "SKILL.md"), "---\ndescription: d\n---\nbody")
+
+	got := nonBundled(Load(dir, func(string) {}))
+	if len(got) != 1 {
+		t.Fatalf("got %d skills, want 1", len(got))
+	}
+	wantDir := filepath.Join(skills, "deploy")
+	if got[0].Dir != wantDir {
+		t.Errorf("dir = %q, want %q", got[0].Dir, wantDir)
 	}
 }
 
@@ -76,6 +172,7 @@ func TestLoadProjectOverlaysHome(t *testing.T) {
 	cwd := t.TempDir()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "")
 
 	write(t, filepath.Join(home, ".klaudia", "skills", "review.md"), "---\nname: review\ndescription: home version\n---\nhome body")
 	write(t, filepath.Join(home, ".klaudia", "skills", "deploy.md"), "---\nname: deploy\ndescription: deploy\n---\ndeploy")
@@ -86,7 +183,7 @@ func TestLoadProjectOverlaysHome(t *testing.T) {
 	write(t, filepath.Join(cwd, ".klaudia", "skills", "bad.md"), "---\ntype: nonsense\n---\nx")
 
 	var warnings []string
-	got := Load(cwd, func(s string) { warnings = append(warnings, s) })
+	got := nonBundled(Load(cwd, func(s string) { warnings = append(warnings, s) }))
 
 	byName := map[string]Skill{}
 	for _, sk := range got {
@@ -110,6 +207,7 @@ func TestLoadProjectOverlaysHome(t *testing.T) {
 }
 
 func TestLoadDirSkillLayout(t *testing.T) {
+	isolateHome(t)
 	dir := t.TempDir()
 	skills := filepath.Join(dir, ".klaudia", "skills")
 	mustMkdir(t, filepath.Join(skills, "deploy"))
@@ -120,7 +218,7 @@ Deploy the service. $ARGUMENTS`)
 	// Supporting files beside the definition are the reason this layout exists.
 	write(t, filepath.Join(skills, "deploy", "checklist.md"), "not a skill")
 
-	got := Load(dir, func(string) {})
+	got := onDisk(Load(dir, func(string) {}))
 	if len(got) != 1 {
 		t.Fatalf("got %d skills, want 1: %+v", len(got), got)
 	}
@@ -137,13 +235,14 @@ Deploy the service. $ARGUMENTS`)
 }
 
 func TestLoadDirWarnsOnSkillDirWithoutDefinition(t *testing.T) {
+	isolateHome(t)
 	dir := t.TempDir()
 	skills := filepath.Join(dir, ".klaudia", "skills")
 	mustMkdir(t, filepath.Join(skills, "halfdone"))
 	write(t, filepath.Join(skills, "halfdone", "notes.md"), "just notes")
 
 	var warnings []string
-	got := Load(dir, func(m string) { warnings = append(warnings, m) })
+	got := onDisk(Load(dir, func(m string) { warnings = append(warnings, m) }))
 	if len(got) != 0 {
 		t.Fatalf("got %d skills, want 0", len(got))
 	}
@@ -154,6 +253,7 @@ func TestLoadDirWarnsOnSkillDirWithoutDefinition(t *testing.T) {
 }
 
 func TestLoadDirFrontmatterNameStillWins(t *testing.T) {
+	isolateHome(t)
 	dir := t.TempDir()
 	skills := filepath.Join(dir, ".klaudia", "skills")
 	mustMkdir(t, filepath.Join(skills, "folder-name"))
@@ -163,10 +263,19 @@ description: d
 ---
 body`)
 
-	got := Load(dir, func(string) {})
+	got := onDisk(Load(dir, func(string) {}))
 	if len(got) != 1 || got[0].Name != "explicit" {
 		t.Fatalf("frontmatter name should win, got %+v", got)
 	}
+}
+
+// isolateHome points HOME at an empty directory. Load reads ~/.claude/skills and
+// ~/.klaudia/skills, so a test that doesn't pin HOME sees whatever skills the
+// developer has installed and passes or fails depending on the machine.
+func isolateHome(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
 }
 
 func mustMkdir(t *testing.T, dir string) {
@@ -177,6 +286,7 @@ func mustMkdir(t *testing.T, dir string) {
 }
 
 func TestLoadReadsClaudeDirectories(t *testing.T) {
+	isolateHome(t)
 	dir := t.TempDir()
 	// What a skills installer leaves behind for Claude Code.
 	write(t, filepath.Join(dir, ".claude", "skills", "frontend-design", "SKILL.md"), `---
@@ -196,7 +306,7 @@ description: only in .claude
 ---
 body`)
 
-	got := Load(dir, func(string) {})
+	got := onDisk(Load(dir, func(string) {}))
 	if len(got) != 2 {
 		t.Fatalf("got %d skills, want 2: %+v", len(got), got)
 	}
@@ -210,4 +320,74 @@ body`)
 	if _, ok := byName["solo"]; !ok {
 		t.Error("a skill only in .claude/skills should load")
 	}
+}
+
+// Launched from a subdirectory, the project root's skills load, and the
+// subdirectory's own (where they lived when skills were keyed by cwd) still
+// do, winning a name collision as the closer directory.
+func TestLoadProjectReadsTheRootThenCWD(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
+	root := t.TempDir()
+	cwd := filepath.Join(root, "internal", "tui")
+
+	write(t, filepath.Join(root, ".klaudia", "skills", "review.md"), "---\nname: review\ndescription: root version\n---\nroot")
+	write(t, filepath.Join(root, ".claude", "skills", "ship", "SKILL.md"), "---\nname: ship\ndescription: ship\n---\nship")
+	write(t, filepath.Join(cwd, ".klaudia", "skills", "review.md"), "---\nname: review\ndescription: subdir version\n---\nsub")
+	write(t, filepath.Join(cwd, ".klaudia", "skills", "local.md"), "---\nname: local\ndescription: local\n---\nlocal")
+
+	byName := map[string]Skill{}
+	for _, sk := range LoadProject(root, cwd, func(string) {}) {
+		byName[sk.Name] = sk
+	}
+	if _, ok := byName["ship"]; !ok {
+		t.Error("root skill ship not loaded from a subdirectory launch")
+	}
+	if _, ok := byName["local"]; !ok {
+		t.Error("cwd skill local not loaded")
+	}
+	if byName["review"].Description != "subdir version" {
+		t.Errorf("review = %q, want the subdirectory's version to win", byName["review"].Description)
+	}
+
+	// Load(cwd) alone still sees only cwd's project skills.
+	for _, sk := range Load(cwd, func(string) {}) {
+		if sk.Name == "ship" {
+			t.Error("Load(cwd) read the root's skills")
+		}
+	}
+}
+
+func TestLoadUserSkillsFollowKlaudiaConfigDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
+	dir := t.TempDir()
+	t.Setenv("KLAUDIA_CONFIG_DIR", dir)
+
+	write(t, filepath.Join(home, ".klaudia", "skills", "stale.md"), "---\nname: stale\ndescription: d\n---\nx")
+	write(t, filepath.Join(dir, "skills", "moved.md"), "---\nname: moved\ndescription: d\n---\nx")
+
+	names := map[string]bool{}
+	for _, sk := range Load(t.TempDir(), nil) {
+		names[sk.Name] = true
+	}
+	if !names["moved"] {
+		t.Error("skill under $KLAUDIA_CONFIG_DIR/skills not loaded")
+	}
+	if names["stale"] {
+		t.Error("skill under ~/.klaudia/skills loaded although KLAUDIA_CONFIG_DIR points elsewhere")
+	}
+}
+
+// nonBundled drops the skills compiled into the binary, so a test that set up
+// only user/project skills can assert on exactly those.
+func nonBundled(skills []Skill) []Skill {
+	out := skills[:0:0]
+	for _, sk := range skills {
+		if !sk.Bundled {
+			out = append(out, sk)
+		}
+	}
+	return out
 }

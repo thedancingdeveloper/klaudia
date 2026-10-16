@@ -39,7 +39,14 @@ type Grant struct {
 // Scope is the reach of one grant. Every field is a list of exact names; there
 // is no pattern syntax by construction.
 type Scope struct {
-	Paths    []string // canonical directory or file prefixes
+	Paths []string // canonical directory or file prefixes
+	// Named are the scope paths the request named itself, as opposed to the
+	// parent directory widenPath chose. Deleting a scope path is refused —
+	// approving one file must not authorise removing its directory — but a
+	// path the user was asked about by name is exactly what was approved:
+	// approving the delete of /tmp/scratch (granted exactly, since /tmp is a
+	// root) must let `rm /tmp/scratch` run (#305).
+	Named    []string
 	Services []string // unit names, without .service/.plist
 	Packages []string // package names, without the manager prefix
 	Kinds    []Kind   // the kinds this grant authorises
@@ -124,6 +131,9 @@ func (l *Ledger) scopeFor(req Request) (Scope, error) {
 			return Scope{}, ErrTooBroad{Value: p}
 		}
 		s.Paths = appendUnique(s.Paths, w)
+		if w == full {
+			s.Named = appendUnique(s.Named, w)
+		}
 	}
 	for _, svc := range req.Services {
 		if strings.ContainsAny(svc, "*?") {
@@ -265,10 +275,12 @@ func coveredBy(grants []*Grant, e Effect) bool {
 	if e.Kind == KindDestructiveBulk || e.Kind == KindOpaque {
 		return false
 	}
-	if !e.Certain {
+	if !e.Certain && !spelledRemote(e) {
 		// An effect we could not pin down cannot be matched against a scope
 		// honestly. Saying "covered" here would mean a grant for /etc/nginx
-		// silently authorising `> "$TARGET"`.
+		// silently authorising `> "$TARGET"`. The one exception is a remote
+		// path spelled out in full (Effect.Spelled): it names exactly what
+		// the scope names.
 		return false
 	}
 	for _, g := range grants {
@@ -294,7 +306,7 @@ func (s Scope) allows(e Effect) bool {
 			// /etc/nginx/nginx.conf" widens to /etc/nginx so the rest of the
 			// operation can proceed; it must not thereby authorise
 			// `rm -rf /etc/nginx`.
-			if e.Kind == KindDelete && e.Res.ID == p {
+			if e.Kind == KindDelete && e.Res.ID == p && (e.Recursive || !contains(s.Named, p)) {
 				continue
 			}
 			return true
@@ -461,4 +473,29 @@ func (l *Ledger) MintFromEffects(summary, reason string, effects []Effect) (*Gra
 		return nil, nil
 	}
 	return l.Mint(req)
+}
+
+// spelledRemote reports whether an uncertain effect may still be matched
+// against a scope: a path on another host spelled out as an absolute literal.
+//
+// Only a non-recursive delete qualifies. A remote path cannot be resolved from
+// here, so a scope on another host is matched by name alone, and a write
+// inside it can plant a symlink (`cp -s`, `mv`, `rsync`, `tar`) that makes a
+// later path "inside" the scope land anywhere. Writes through a remote scope
+// therefore stay with the user every time; only deleting the named files —
+// the #305 case — is covered. A delete through a symlink that already exists
+// on that host is a residual risk this reader cannot see.
+func spelledRemote(e Effect) bool {
+	return e.Spelled && e.Zone == ZoneRemote && e.Res.Class == "path" &&
+		e.Res.ID != "" && filepath.IsAbs(e.Res.ID) &&
+		e.Kind == KindDelete && !e.Recursive
+}
+
+func contains(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }

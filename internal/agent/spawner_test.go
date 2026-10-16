@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 
 	"github.com/greenthread-ai/klaudia/internal/api"
+	"github.com/greenthread-ai/klaudia/internal/subagent"
 	"github.com/greenthread-ai/klaudia/internal/tools"
 )
 
@@ -56,8 +58,8 @@ func TestSpawnRelaysChildToolCallsAsProgress(t *testing.T) {
 	}}
 
 	var lines []string
-	_, err := readOnlySpawner(t, provider, dir, 0).
-		Spawn(context.Background(), "Explore", "read it", func(l string) { lines = append(lines, l) })
+	_, _, err := readOnlySpawner(t, provider, dir, 0).
+		Spawn(context.Background(), nil, "Explore", "read it", func(l string) { lines = append(lines, l) })
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -80,8 +82,8 @@ func TestSpawnWithoutProgressIsSafe(t *testing.T) {
 	provider := &scriptedProvider{turns: []anthropic.BetaMessage{
 		toolUseTurn(t, "tu1", "Read", map[string]any{"file_path": path}),
 	}}
-	if _, err := readOnlySpawner(t, provider, dir, 0).
-		Spawn(context.Background(), "Explore", "read it", nil); err != nil {
+	if _, _, err := readOnlySpawner(t, provider, dir, 0).
+		Spawn(context.Background(), nil, "Explore", "read it", nil); err != nil {
 		t.Fatalf("Spawn with nil progress: %v", err)
 	}
 }
@@ -94,8 +96,8 @@ func TestSpawnIsBoundedWhenNoMaxTurnsIsSet(t *testing.T) {
 	dir, path := fixtureFile(t)
 	provider := &repeatProvider{turn: toolUseTurn(t, "tu1", "Read", map[string]any{"file_path": path})}
 
-	out, err := readOnlySpawner(t, provider, dir, 0).
-		Spawn(context.Background(), "Explore", "loop forever", nil)
+	out, _, err := readOnlySpawner(t, provider, dir, 0).
+		Spawn(context.Background(), nil, "Explore", "loop forever", nil)
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -111,12 +113,95 @@ func TestSpawnIsBoundedWhenNoMaxTurnsIsSet(t *testing.T) {
 func TestSpawnHonoursExplicitMaxTurns(t *testing.T) {
 	dir, path := fixtureFile(t)
 	provider := &repeatProvider{turn: toolUseTurn(t, "tu1", "Read", map[string]any{"file_path": path})}
-	if _, err := readOnlySpawner(t, provider, dir, 2).
-		Spawn(context.Background(), "Explore", "loop", nil); err != nil {
+	if _, _, err := readOnlySpawner(t, provider, dir, 2).
+		Spawn(context.Background(), nil, "Explore", "loop", nil); err != nil {
 		t.Fatal(err)
 	}
 	if provider.calls > 3 {
 		t.Errorf("explicit max-turns ignored: %d calls", provider.calls)
+	}
+}
+
+// A type that names its own maxTurns stops there even when the session's
+// bound is higher. The type's author wrote the bound for a reason.
+func TestSpawnHonoursTheTypesMaxTurns(t *testing.T) {
+	dir, path := fixtureFile(t)
+	provider := &repeatProvider{turn: toolUseTurn(t, "tu1", "Read", map[string]any{"file_path": path})}
+	s := readOnlySpawner(t, provider, dir, 50).WithTypes([]subagent.Type{{
+		Name: "Reviewer", Tools: []string{"Read"}, MaxTurns: 2,
+	}})
+	if _, _, err := s.Spawn(context.Background(), nil, "Reviewer", "loop", nil); err != nil {
+		t.Fatal(err)
+	}
+	if provider.calls > 3 {
+		t.Errorf("the type's maxTurns was ignored: %d calls", provider.calls)
+	}
+}
+
+// The same bound holds when it comes from a file rather than a constructed
+// type: maxTurns: 2 in frontmatter stops the child at 2.
+func TestSpawnHonoursLoadedMaxTurns(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "")
+	dir, path := fixtureFile(t)
+	os.MkdirAll(filepath.Join(dir, ".klaudia", "agents"), 0o755)
+	os.WriteFile(filepath.Join(dir, ".klaudia", "agents", "reviewer.md"), []byte(
+		"---\nname: reviewer\ndescription: reviews\nmaxTurns: 2\n---\nReview."), 0o644)
+	provider := &repeatProvider{turn: toolUseTurn(t, "tu1", "Read", map[string]any{"file_path": path})}
+	s := readOnlySpawner(t, provider, dir, 50).WithTypes(subagent.Load(dir, nil))
+	if _, _, err := s.Spawn(context.Background(), nil, "reviewer", "loop", nil); err != nil {
+		t.Fatal(err)
+	}
+	if provider.calls > 3 {
+		t.Errorf("loaded maxTurns was ignored: %d calls", provider.calls)
+	}
+}
+
+// A tool the frontmatter disallows is not in the registry the child runs
+// with, even when the type otherwise grants everything.
+func TestLoadedDisallowedToolIsAbsent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "")
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, ".klaudia", "agents"), 0o755)
+	os.WriteFile(filepath.Join(dir, ".klaudia", "agents", "safe.md"), []byte(
+		"---\nname: safe\ndescription: no bash\ndisallowedTools: [Bash]\n---\nBe careful."), 0o644)
+	loaded, ok := subagent.Find(subagent.Load(dir, nil), "safe")
+	if !ok {
+		t.Fatal("safe was not loaded")
+	}
+	read, err := tools.NewRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := loaded.Filter(tools.NewRegistry(read, namedStub("Bash")))
+	if _, ok := got.Lookup("Bash"); ok {
+		t.Error("Bash survived disallowedTools")
+	}
+	if _, ok := got.Lookup("Read"); !ok {
+		t.Error("Read was removed along with Bash")
+	}
+}
+
+// With no session bound the ceiling is the shared default, not whatever the
+// call or the type file asked for.
+func TestChildMaxTurnsCapsAtTheDefault(t *testing.T) {
+	s := &Spawner{}
+	if got := s.childMaxTurns(ChildSpec{RequestedMaxTurns: 1000}, subagent.Type{}); got != defaultSubagentMaxTurns {
+		t.Errorf("requested 1000 on a default spawner gave %d, want %d", got, defaultSubagentMaxTurns)
+	}
+	if got := s.childMaxTurns(ChildSpec{}, subagent.Type{MaxTurns: 1000}); got != defaultSubagentMaxTurns {
+		t.Errorf("type maxTurns 1000 on a default spawner gave %d, want %d", got, defaultSubagentMaxTurns)
+	}
+	// A tighter request still wins, and a session bound still caps both.
+	if got := s.childMaxTurns(ChildSpec{RequestedMaxTurns: 3}, subagent.Type{MaxTurns: 1000}); got != 3 {
+		t.Errorf("a tighter request gave %d, want 3", got)
+	}
+	s.maxTurns = 20
+	if got := s.childMaxTurns(ChildSpec{RequestedMaxTurns: 1000}, subagent.Type{MaxTurns: 1000}); got != 20 {
+		t.Errorf("the session ceiling gave %d, want 20", got)
 	}
 }
 
@@ -166,5 +251,53 @@ func TestProgressLineIsClippedToOneLine(t *testing.T) {
 	}
 	if len([]rune(got)) > progressFieldLimit+len("Bash ") {
 		t.Errorf("progress line not clipped: %d runes", len([]rune(got)))
+	}
+}
+
+func reply(t *testing.T, text string) anthropic.BetaMessage {
+	t.Helper()
+	quoted, err := json.Marshal(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b anthropic.BetaContentBlockUnion
+	if err := json.Unmarshal([]byte(`{"type":"text","text":`+string(quoted)+`}`), &b); err != nil {
+		t.Fatal(err)
+	}
+	return anthropic.BetaMessage{StopReason: "end_turn", Content: []anthropic.BetaContentBlockUnion{b}}
+}
+
+// output_schema gets exactly one correction. A first answer that is prose is
+// refused, the child is shown why, and a second answer that matches is the
+// result. A second answer that still misses is an error, and the text is not
+// thrown away.
+func TestOutputSchemaRetriesOnce(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","required":["ok"],"properties":{"ok":{"type":"boolean"}}}`)
+	s := NewSpawner(&scriptedProvider{turns: []anthropic.BetaMessage{
+		reply(t, "I think so"),
+		reply(t, `{"ok":true}`),
+	}}, tools.NewRegistry(), "claude-opus-4-8", bypassPerm(), nil, 0)
+
+	text, _, err := s.spawn(context.Background(), ChildSpec{OutputSchema: schema}, "Explore", "answer", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, `{"ok":true}`) {
+		t.Errorf("result = %q, want the corrected JSON", text)
+	}
+	if strings.Contains(text, "I think so") {
+		t.Errorf("the rejected first answer was returned: %q", text)
+	}
+
+	s = NewSpawner(&scriptedProvider{turns: []anthropic.BetaMessage{
+		reply(t, "nope"),
+		reply(t, "still nope"),
+	}}, tools.NewRegistry(), "claude-opus-4-8", bypassPerm(), nil, 0)
+	text, _, err = s.spawn(context.Background(), ChildSpec{OutputSchema: schema}, "Explore", "answer", nil)
+	if err == nil {
+		t.Fatal("a second mismatch was accepted")
+	}
+	if !strings.Contains(err.Error(), "still nope") {
+		t.Errorf("the error dropped the text: %v", err)
 	}
 }

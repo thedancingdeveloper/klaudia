@@ -5,6 +5,7 @@
 package bashparser
 
 import (
+	"sort"
 	"strings"
 
 	"mvdan.cc/sh/v3/syntax"
@@ -33,6 +34,19 @@ type Command struct {
 	// callers that must not confuse a partial expansion for a real path.
 	NameWord Word
 	ArgWords []Word
+
+	// Background reports that the command runs asynchronously: its statement,
+	// or one enclosing it, ends in `&` — `a &`, `(a; b) &`, `(a &)`, `a | b &`.
+	// `&&` and the redirections `&>`, `>&`, `2>&1` are not backgrounding.
+	Background bool
+
+	// Chain is the index of the top-level statement the command belongs to,
+	// and ChainStart whether it is the first command of that statement's
+	// `&&` chain. Both are meaningful only when Analysis.Sequential is set:
+	// then a command that starts its chain always runs, and one later in the
+	// chain runs only if every command before it in the chain succeeded.
+	Chain      int
+	ChainStart bool
 }
 
 // Redirect is an output redirection target. Only writing redirections are
@@ -52,6 +66,13 @@ type Analysis struct {
 	// HasExpansion reports whether any word in the line was non-literal. A
 	// cheap top-level "I could not read all of this" signal.
 	HasExpansion bool
+	// Sequential reports that the line is nothing but simple commands joined
+	// by `;`, newlines and `&&` — no pipe, `||`, `&`, `!`, subshell, group,
+	// compound command, function or command substitution. In such a line a
+	// command runs in the shell that runs the next one, in source order, so a
+	// reader can follow state like the working directory across it (see
+	// Command.Chain).
+	Sequential bool
 }
 
 // Parse parses a bash command line. On a parse error the returned Analysis is
@@ -66,9 +87,23 @@ func Parse(input string) (Analysis, error) {
 	if err != nil {
 		return Analysis{}, err
 	}
-
 	var a Analysis
+	// bg is a stack parallel to the walk: whether the node being visited sits
+	// under a backgrounded statement. Walk calls f(nil) after a node's
+	// children, which is where its entry is popped.
+	bg := []bool{false}
+	background := map[*syntax.CallExpr]bool{}
+	var found []*syntax.CallExpr
 	syntax.Walk(prog, func(node syntax.Node) bool {
+		if node == nil {
+			bg = bg[:len(bg)-1]
+			return true
+		}
+		inBg := bg[len(bg)-1]
+		if s, ok := node.(*syntax.Stmt); ok && s.Background {
+			inBg = true
+		}
+		bg = append(bg, inBg)
 		switch n := node.(type) {
 		case *syntax.BinaryCmd:
 			if n.Op == syntax.Pipe || n.Op == syntax.PipeAll {
@@ -99,34 +134,226 @@ func Parse(input string) (Analysis, error) {
 				}
 			}
 		case *syntax.CallExpr:
-			if len(n.Args) == 0 {
-				return true
-			}
-			ws := make([]Word, 0, len(n.Args))
-			for _, w := range n.Args {
-				expanded := word(w)
-				if !expanded.Literal {
-					a.HasExpansion = true
-				}
-				ws = append(ws, expanded)
-			}
-			// The command is recorded even when its name is an expansion
-			// ("$SUDO apt-get install"). Dropping it, as this used to, made the
-			// whole invocation invisible to anything reading Commands.
-			args := make([]string, 0, len(ws)-1)
-			for _, w := range ws[1:] {
-				args = append(args, w.Text)
-			}
-			a.Commands = append(a.Commands, Command{
-				Name:     ws[0].Text,
-				Args:     args,
-				NameWord: ws[0],
-				ArgWords: ws[1:],
-			})
+			found = append(found, n)
+			background[n] = inBg
 		}
 		return true
 	})
+	// The walk visits a word's command substitution before the call the word
+	// belongs to, so `git commit -m "$(cat …)"` is seen as cat and then git.
+	// The shell runs them the other way round, and the reading of the working
+	// directory follows the shell, so the calls are recorded in source order.
+	sort.SliceStable(found, func(i, j int) bool {
+		return found[i].Pos().Offset() < found[j].Pos().Offset()
+	})
+	calls := map[*syntax.CallExpr]int{} // recorded call → index in a.Commands
+	for _, n := range found {
+		if len(n.Args) == 0 {
+			continue
+		}
+		ws := make([]Word, 0, len(n.Args))
+		for _, w := range n.Args {
+			expanded := word(w)
+			if !expanded.Literal {
+				a.HasExpansion = true
+			}
+			ws = append(ws, expanded)
+		}
+		args := make([]string, 0, len(ws)-1)
+		for _, w := range ws[1:] {
+			args = append(args, w.Text)
+		}
+		calls[n] = len(a.Commands)
+		a.Commands = append(a.Commands, Command{
+			Name:       ws[0].Text,
+			Args:       args,
+			NameWord:   ws[0],
+			ArgWords:   ws[1:],
+			Background: background[n],
+		})
+	}
+	a.Sequential = sequential(prog, a.Commands, calls)
 	return a, nil
+}
+
+// sequential reports whether prog is a plain list of `&&` chains of simple
+// commands, and if so numbers each recorded command's chain (Command.Chain).
+//
+// A command substitution breaks it only when its body contains a cd. A
+// substitution runs in its own shell, so that cd never moves the parent, but the
+// parser records it as a command of the line and would otherwise read the rest
+// as running where it landed. A substitution that only reads — a heredoc fed to
+// cat, redirects included — cannot do that.
+//
+// A pipe's sides run in subshells by default, but bash's lastpipe option can
+// run the final side in this shell, and whether it is on is shell state this
+// reading does not track — it can be enabled anywhere earlier on the line,
+// including through eval. So a pipe breaks the chain whenever any of its sides
+// could change this shell's state if it ran here: any bash builtin but a few
+// inert ones, a bare assignment, or a command whose name is not a literal
+// (pipeSideMoves). A pipe whose every side is an
+// ordinary program — `cd wt && git add -A 2>&1 | tail -3` — cannot move the
+// shell whichever side runs where, so it stays in the chain and a cd before
+// it is still followed (#289).
+func sequential(prog *syntax.File, cmds []Command, calls map[*syntax.CallExpr]int) bool {
+	var chain func(s *syntax.Stmt) ([]*syntax.CallExpr, bool)
+	chain = func(s *syntax.Stmt) ([]*syntax.CallExpr, bool) {
+		if s == nil || s.Background || s.Negated || s.Coprocess || s.Disown || substitutionMoves(s) {
+			return nil, false
+		}
+		switch c := s.Cmd.(type) {
+		case *syntax.CallExpr:
+			return []*syntax.CallExpr{c}, true
+		case *syntax.BinaryCmd:
+			if c.Op == syntax.Pipe || c.Op == syntax.PipeAll {
+				// The final side may run in this shell if lastpipe is set,
+				// so a side that could move it breaks the chain.
+				x, ok := chain(c.X)
+				if !ok || pipeSideMoves(x) {
+					return nil, false
+				}
+				y, ok := chain(c.Y)
+				if !ok || pipeSideMoves(y) {
+					return nil, false
+				}
+				return append(x, y...), true
+			}
+			if c.Op != syntax.AndStmt {
+				return nil, false
+			}
+			x, ok := chain(c.X)
+			if !ok {
+				return nil, false
+			}
+			y, ok := chain(c.Y)
+			if !ok {
+				return nil, false
+			}
+			return append(x, y...), true
+		}
+		return nil, false
+	}
+	seq := true
+	assigned := 0
+	for i, s := range prog.Stmts {
+		cs, ok := chain(s)
+		if !ok {
+			seq = false
+			break
+		}
+		for j, c := range cs {
+			if k, ok := calls[c]; ok {
+				cmds[k].Chain, cmds[k].ChainStart = i, j == 0
+				assigned++
+			}
+		}
+	}
+	// A line whose every command sat in a pipe subshell has no chain of its own;
+	// where it runs is not something this reading can vouch for.
+	return seq && assigned > 0
+}
+
+// bashBuiltins are the names bash runs inside the shell itself rather than as
+// a program. Under lastpipe the final pipe side runs in this shell, so any of
+// them there can change its state — its directory, its variables (CDPATH
+// steers a later cd), or code it runs (eval, source, mapfile -C, trap).
+var bashBuiltins = map[string]bool{
+	".": true, ":": true, "[": true, "alias": true, "bg": true, "bind": true, "break": true,
+	"builtin": true, "caller": true, "cd": true, "command": true, "compgen": true,
+	"complete": true, "compopt": true, "continue": true, "declare": true, "dirs": true,
+	"disown": true, "echo": true, "enable": true, "eval": true, "exec": true, "exit": true,
+	"export": true, "false": true, "fc": true, "fg": true, "getopts": true, "hash": true,
+	"help": true, "history": true, "jobs": true, "kill": true, "let": true, "local": true,
+	"logout": true, "mapfile": true, "popd": true, "printf": true, "pushd": true, "pwd": true,
+	"read": true, "readarray": true, "readonly": true, "return": true, "set": true,
+	"shift": true, "shopt": true, "source": true, "suspend": true, "test": true, "times": true,
+	"trap": true, "true": true, "type": true, "typeset": true, "ulimit": true, "umask": true,
+	"unalias": true, "unset": true, "wait": true,
+}
+
+// inertBuiltins are the builtins that read nothing into the shell and change
+// none of its state, so a pipe side may run them wherever it runs. printf is
+// one only without -v.
+var inertBuiltins = map[string]bool{
+	":": true, "[": true, "echo": true, "false": true, "printf": true, "pwd": true,
+	"test": true, "true": true,
+}
+
+// pipeSideMoves reports whether any command on a pipe side could change this
+// shell's state if lastpipe ran it here: any builtin but an inert one, printf
+// with -v, a bare assignment, or a command whose name is not one literal word.
+// A program (git, tail, grep, xargs, env) runs in a process of its own and
+// cannot.
+func pipeSideMoves(calls []*syntax.CallExpr) bool {
+	for _, c := range calls {
+		if len(c.Args) == 0 {
+			return true
+		}
+		name, literal := wordParts(c.Args[0])
+		if !literal {
+			return true
+		}
+		name = base(name)
+		if bashBuiltins[name] && !inertBuiltins[name] {
+			return true
+		}
+		if name == "printf" {
+			for _, a := range c.Args[1:] {
+				if strings.HasPrefix(wordText(a), "-v") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// substitutionMoves reports whether a statement's command substitutions
+// contain a cd. A plain `$( …; )` runs in its own shell and never moves the
+// parent, so a cd there is only recorded as a command of the line. But bash
+// 5.3's `${ …; }` and `${| …; }` forms run in the *current* shell — mvdan.cc/sh
+// parses them as CmdSubst with TempFile or ReplyVar set — so a cd inside one
+// (even via eval) moves the parent and must break sequential analysis.
+func substitutionMoves(s *syntax.Stmt) bool {
+	moves := false
+	var walk func([]*syntax.Stmt)
+	walk = func(stmts []*syntax.Stmt) {
+		for _, st := range stmts {
+			syntax.Walk(st, func(node syntax.Node) bool {
+				switch n := node.(type) {
+				case *syntax.CallExpr:
+					if len(n.Args) > 0 && wordText(n.Args[0]) == "cd" {
+						moves = true
+					}
+				case *syntax.CmdSubst:
+					if n.ReplyVar || n.TempFile {
+						moves = true
+					}
+					walk(n.Stmts)
+					return false
+				case *syntax.ProcSubst:
+					walk(n.Stmts)
+					return false
+				}
+				return true
+			})
+		}
+	}
+	syntax.Walk(s, func(node syntax.Node) bool {
+		switch n := node.(type) {
+		case *syntax.CmdSubst:
+			if n.ReplyVar || n.TempFile {
+				moves = true
+			}
+			walk(n.Stmts)
+			return false
+		case *syntax.ProcSubst:
+			walk(n.Stmts)
+			return false
+		}
+		return true
+	})
+	return moves
 }
 
 // Prefix returns a permission specifier for the first command: the program
@@ -140,14 +367,25 @@ func (a Analysis) Prefix() string {
 	if len(a.Commands) == 0 {
 		return ""
 	}
-	c := a.Commands[0]
-	for _, arg := range c.Args {
+	return ShortForm(a.Commands[0].Name, a.Commands[0].Args)
+}
+
+// ShortForm is a command's "program subcommand" form: the name plus its first
+// non-flag argument ("git status"), or the name alone when there is none. It
+// is the form Prefix gives the first command, and the form older permission
+// rules were written against.
+func ShortForm(name string, args []string) string {
+	for _, arg := range args {
 		if !strings.HasPrefix(arg, "-") {
-			return c.Name + " " + arg
+			return name + " " + arg
 		}
 	}
-	return c.Name
+	return name
 }
+
+// Base strips any directory from a program name, so /usr/bin/sudo and sudo
+// are recognised alike.
+func Base(name string) string { return base(name) }
 
 // ShellPayloads returns the script text passed to an inline shell — the
 // argument after -c for sh/bash/zsh/dash/ksh, and the argument to eval.
@@ -159,23 +397,32 @@ func (a Analysis) Prefix() string {
 func (a Analysis) ShellPayloads() []string {
 	var out []string
 	for _, c := range a.Commands {
-		switch base(c.Name) {
-		case "sh", "bash", "zsh", "dash", "ksh":
-			for i, arg := range c.Args {
-				// -c, and combined forms like -lc / -ec that end in c.
-				if strings.HasPrefix(arg, "-") && strings.HasSuffix(arg, "c") && i+1 < len(c.Args) {
-					out = append(out, c.Args[i+1])
-					break
-				}
-			}
-		case "eval":
-			// eval concatenates its arguments into one script.
-			if len(c.Args) > 0 {
-				out = append(out, strings.Join(c.Args, " "))
-			}
+		if p, ok := ShellPayload(c.Name, c.Args); ok {
+			out = append(out, p)
 		}
 	}
 	return out
+}
+
+// ShellPayload returns the script an inline shell or eval runs — the argument
+// after -c for sh/bash/zsh/dash/ksh, the joined arguments of eval — for one
+// command given as its program and arguments.
+func ShellPayload(name string, args []string) (string, bool) {
+	switch base(name) {
+	case "sh", "bash", "zsh", "dash", "ksh":
+		for i, arg := range args {
+			// -c, and combined forms like -lc / -ec that end in c.
+			if strings.HasPrefix(arg, "-") && strings.HasSuffix(arg, "c") && i+1 < len(args) {
+				return args[i+1], true
+			}
+		}
+	case "eval":
+		// eval concatenates its arguments into one script.
+		if len(args) > 0 {
+			return strings.Join(args, " "), true
+		}
+	}
+	return "", false
 }
 
 // base strips any directory from a program name, so /usr/bin/sudo and sudo

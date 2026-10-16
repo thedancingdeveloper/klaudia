@@ -7,13 +7,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -25,6 +28,11 @@ import (
 // ServerConfig defines how to reach an MCP server. A stdio server sets
 // Command (+ Args/Env); an HTTP server sets URL (Type selects the streamable
 // HTTP transport, the default, or "sse" for the legacy SSE transport).
+//
+// Command, Args, Env values and URL may reference Klaudia's environment as
+// ${VAR} or ${VAR:-default}, the syntax the reference MCP clients accept in
+// .mcp.json. They are resolved at connect time, not at load: the stored config
+// stays as written, so a reload can tell an unchanged file from a changed one.
 type ServerConfig struct {
 	// stdio transport
 	Command string            `json:"command,omitempty"`
@@ -33,6 +41,14 @@ type ServerConfig struct {
 	// HTTP transport
 	Type string `json:"type,omitempty"` // "http" (default when URL set) | "sse"
 	URL  string `json:"url,omitempty"`
+	// Headers are sent with every HTTP request to the server, values
+	// ${VAR}-expanded like url - for a server behind a bearer token or an
+	// access proxy, without writing the secret into the file.
+	Headers map[string]string `json:"headers,omitempty"`
+	// AlwaysLoad offers this server's tools to the model from the start
+	// rather than behind ToolSearch, for a server whose tools are used in
+	// almost every session.
+	AlwaysLoad bool `json:"alwaysLoad,omitempty"`
 	// ReadOnly overrides what this server's tools claim about themselves, in
 	// either direction. Unset trusts the server's readOnlyHint annotations.
 	//
@@ -51,6 +67,12 @@ type ServerConfig struct {
 	// word taken. False is how an operator declines to take it, without giving
 	// up the server for the main agent, which still asks before every call.
 	ReadOnly *bool `json:"readOnly,omitempty"`
+	// Timeout bounds one tool call on this server, in seconds. Unset uses
+	// KLAUDIA_MCP_TOOL_TIMEOUT, or ten minutes.
+	Timeout int `json:"timeout,omitempty"`
+	// OAuth, when set, authorizes a remote (URL) server with OAuth 2.1. It is
+	// ignored for stdio servers. See OAuthConfig for the supported grants.
+	OAuth *OAuthConfig `json:"oauth,omitempty"`
 }
 
 // Config is the .mcp.json shape: a map of server name → launch config.
@@ -84,6 +106,29 @@ func ConfigPaths(dir string) []string {
 	return out
 }
 
+// LoadGlobalConfig reads only the global ~/.klaudia/.mcp.json (honouring
+// KLAUDIA_CONFIG_DIR). Used by --safe-mode, which starts no server a project
+// file names.
+func LoadGlobalConfig() (Config, error) {
+	cfg := Config{MCPServers: map[string]ServerConfig{}}
+	p := filepath.Join(session.ConfigRoot(), ".mcp.json")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return cfg, err
+	}
+	var c Config
+	if err := json.Unmarshal(stripJSONComments(data), &c); err != nil {
+		return cfg, fmt.Errorf("%s: %w", p, err)
+	}
+	for name, sc := range c.MCPServers {
+		cfg.MCPServers[name] = sc
+	}
+	return cfg, nil
+}
+
 // LoadConfig reads the .mcp.json files that apply to dir (see ConfigPaths), in
 // increasing precedence. A missing file yields an empty config (not an error);
 // later files override earlier ones per server name, so a project can redefine
@@ -93,27 +138,95 @@ func ConfigPaths(dir string) []string {
 // project rather than in one repo — installable once. Without it the only
 // answer was to copy the same file into every checkout.
 func LoadConfig(dir string) (Config, error) {
-	cfg := Config{MCPServers: map[string]ServerConfig{}}
+	cfg, _, err := LoadConfigFor(dir, true)
+	return cfg, err
+}
+
+// LoadConfigFor is LoadConfig with the project's own files — ./.mcp.json and
+// ./.klaudia/.mcp.json — read only when trustProject is set. Those files
+// arrive with a checkout, and a stdio server in one is a command Klaudia runs
+// on startup and on every reload: opening a cloned repository used to run
+// whatever it named. Untrusted, they are skipped and the servers they would
+// have started are returned in held, so the caller can say which. The global
+// file always applies; a global server a project file would have redefined
+// keeps its global definition.
+func LoadConfigFor(dir string, trustProject bool) (cfg Config, held []string, err error) {
+	cfg = Config{MCPServers: map[string]ServerConfig{}}
+	global := filepath.Join(session.ConfigRoot(), ".mcp.json")
 	for _, p := range ConfigPaths(dir) {
+		// A FIFO or device named .mcp.json would block ReadFile forever and
+		// hang startup; only a regular file is config.
+		if st, serr := os.Stat(p); serr == nil && !st.Mode().IsRegular() {
+			return cfg, held, fmt.Errorf("%s: not a regular file", p)
+		}
 		data, err := os.ReadFile(p)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
-			return cfg, err
+			return cfg, held, err
 		}
 		var c Config
 		if err := json.Unmarshal(stripJSONComments(data), &c); err != nil {
 			// The full path, not the base name: three files share the name
 			// ".mcp.json", and "which one is broken" is the entire question
 			// when the answer is a config in a different directory.
-			return cfg, fmt.Errorf("%s: %w", p, err)
+			return cfg, held, fmt.Errorf("%s: %w", p, err)
+		}
+		if p != global && !trustProject {
+			for name := range c.MCPServers {
+				held = append(held, name)
+			}
+			continue
 		}
 		for name, sc := range c.MCPServers {
 			cfg.MCPServers[name] = sc
 		}
 	}
-	return cfg, nil
+	sort.Strings(held)
+	return cfg, held, nil
+}
+
+// ParseConfigArg parses one --mcp-config value. It is inline JSON when it begins
+// (after trimming) with '{' or '[', otherwise a path to a .mcp.json-shaped file.
+// Either way it must carry the top-level "mcpServers" object, the same shape
+// LoadConfig reads; JSONC comments are tolerated as they are for on-disk configs.
+func ParseConfigArg(arg string) (Config, error) {
+	s := strings.TrimSpace(arg)
+	if s == "" {
+		return Config{MCPServers: map[string]ServerConfig{}}, nil
+	}
+	var data []byte
+	if strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[") {
+		data = []byte(s)
+	} else {
+		b, err := os.ReadFile(s)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: %w", s, err)
+		}
+		data = b
+	}
+	var c Config
+	if err := json.Unmarshal(stripJSONComments(data), &c); err != nil {
+		return Config{}, fmt.Errorf("%s: %w", s, err)
+	}
+	if c.MCPServers == nil {
+		c.MCPServers = map[string]ServerConfig{}
+	}
+	return c, nil
+}
+
+// Merge folds extra's servers into cfg, extra winning on a name clash (it is the
+// later, more specific source — a CLI --mcp-config over the on-disk .mcp.json).
+// It mutates and returns cfg.
+func Merge(cfg, extra Config) Config {
+	if cfg.MCPServers == nil {
+		cfg.MCPServers = map[string]ServerConfig{}
+	}
+	for name, sc := range extra.MCPServers {
+		cfg.MCPServers[name] = sc
+	}
+	return cfg
 }
 
 // Server is a connected MCP server session and its configured name.
@@ -126,6 +239,19 @@ type Server struct {
 
 	mu      sync.RWMutex
 	session *mcpsdk.ClientSession
+	// listErr is why the last tools/list failed, or nil.
+	listErr error
+
+	// reviveMu serialises automatic relaunches of this one server, and
+	// lastRevive rate-limits them. Both are needed because the attempt can come
+	// from anywhere: two tool calls, or a tool call and /mcp, arriving together
+	// would otherwise each spawn a child process and close one of them.
+	reviveMu   sync.Mutex
+	lastRevive time.Time
+	// parked is set by an explicit Disconnect (/mcp) and cleared by
+	// Reconnect. Automatic revival leaves a parked server alone: the user
+	// turned it off, and a tool call is not a request to turn it back on.
+	parked atomic.Bool
 }
 
 // sess returns the live session, or nil when the server is disconnected.
@@ -154,6 +280,21 @@ func (s *Server) swapSession(next *mcpsdk.ClientSession) *mcpsdk.ClientSession {
 // is not a health check: see alive.
 func (s *Server) Connected() bool { return s.sess() != nil }
 
+// ListError is why the server's tool list could not be read the last time it
+// was asked, or nil. A connected server that fails to list looked exactly
+// like one with no tools; this is what /mcp and startup report instead.
+func (s *Server) ListError() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.listErr
+}
+
+func (s *Server) setListError(err error) {
+	s.mu.Lock()
+	s.listErr = err
+	s.mu.Unlock()
+}
+
 // alive reports whether the server still answers a protocol ping.
 //
 // Connected only says a session object exists. A stdio server whose child
@@ -172,43 +313,145 @@ func (s *Server) alive(ctx context.Context) bool {
 	return sess.Ping(ctx, nil) == nil
 }
 
-func newClient() *mcpsdk.Client {
-	return mcpsdk.NewClient(&mcpsdk.Implementation{Name: "klaudia", Version: version.Version}, nil)
+// newClient builds the MCP client for one server. opts carries the
+// Manager's per-session handlers (tools/list_changed); it may be nil.
+//
+// Capabilities are set explicitly, which also drops the SDK's default
+// "roots":{"listChanged":true}. Klaudia never registers a root, so that default
+// advertised a feature whose only possible answer was an empty list — and roots
+// is deprecated as of protocol 2026-07-28 anyway. Elicitation is advertised
+// form-only, and only when there is a frontend to carry the question; see
+// elicit.go.
+func newClient(name string, opts *mcpsdk.ClientOptions, el *Elicitor) *mcpsdk.Client {
+	o := mcpsdk.ClientOptions{}
+	if opts != nil {
+		o = *opts
+	}
+	opts = &o
+	opts.Capabilities = &mcpsdk.ClientCapabilities{}
+	if h := el.handlerFor(name); h != nil {
+		opts.ElicitationHandler = h
+		opts.Capabilities.Elicitation = &mcpsdk.ElicitationCapabilities{
+			Form: &mcpsdk.FormElicitationCapabilities{},
+		}
+	}
+	return mcpsdk.NewClient(&mcpsdk.Implementation{Name: "klaudia", Version: version.Version}, opts)
 }
 
 // connectServer connects to a server using the transport its config implies:
-// HTTP (streamable, or SSE) when URL is set, otherwise stdio.
-func connectServer(ctx context.Context, name string, cfg ServerConfig) (*Server, error) {
+// HTTP (streamable, or SSE) when URL is set, otherwise stdio. ${VAR} and
+// ${VAR:-default} references in the config are resolved against Klaudia's
+// environment first (see expandServerConfig); an unresolvable one is this
+// server's error and leaves the others alone.
+//
+// opts carries the client options (e.g. the tools/list_changed handler) the
+// Manager wants on this session. It may be nil — tests and callers that do not
+// need server-initiated notifications pass nothing. el, when non-nil, lets
+// the server ask the user a question (elicitation).
+func connectServer(ctx context.Context, name string, cfg ServerConfig, opts *mcpsdk.ClientOptions, el *Elicitor) (*Server, error) {
+	// Remember what each ${VAR} resolved to, so a failure can be reported
+	// without it: a URL or argument carrying a token ends up in the SDK's
+	// error text (and a server may echo it to stderr, which is appended), and
+	// that error goes to the terminal, the TUI and the model.
+	resolved := map[string]string{}
+	lookup := func(k string) (string, bool) {
+		v, ok := os.LookupEnv(k)
+		if ok && v != "" {
+			resolved[k] = v
+		}
+		return v, ok
+	}
+	srv, err := connectExpanded(ctx, name, cfg, lookup, opts, el)
+	if err != nil {
+		return nil, redactValues(err, resolved)
+	}
+	return srv, nil
+}
+
+func connectExpanded(ctx context.Context, name string, cfg ServerConfig, lookup func(string) (string, bool), opts *mcpsdk.ClientOptions, el *Elicitor) (*Server, error) {
+	cfg, err := expandServerConfig(name, cfg, lookup)
+	if err != nil {
+		return nil, err
+	}
 	if url := strings.TrimSpace(cfg.URL); url != "" {
-		var t mcpsdk.Transport
+		// OAuth authorization applies only to remote servers. A nil client means
+		// "use the transport's default" (no Authorization header).
+		httpClient, err := oauthHTTPClient(ctx, name, cfg.OAuth, lookup)
+		if err != nil {
+			return nil, err
+		}
+		// Configured static headers ride on top of whatever the OAuth client
+		// set (both, if both are configured).
+		if len(cfg.Headers) > 0 {
+			base := http.DefaultTransport
+			if httpClient != nil && httpClient.Transport != nil {
+				base = httpClient.Transport
+			}
+			if httpClient == nil {
+				httpClient = &http.Client{}
+			}
+			httpClient.Transport = headerTransport{base: base, headers: cfg.Headers}
+		}
 		switch strings.ToLower(strings.TrimSpace(cfg.Type)) {
 		case "sse":
-			t = &mcpsdk.SSEClientTransport{Endpoint: url}
-		default: // "http" / "streamable" / unset
-			t = &mcpsdk.StreamableClientTransport{Endpoint: url}
+			return connectTransport(ctx, name, &mcpsdk.SSEClientTransport{Endpoint: url, HTTPClient: httpClient}, opts, el)
+		case "http", "streamable":
+			return connectTransport(ctx, name, &mcpsdk.StreamableClientTransport{Endpoint: url, HTTPClient: httpClient}, opts, el)
 		}
-		return ConnectTransport(ctx, name, t)
+		// Type unset: try streamable HTTP, and if the server does not speak
+		// it, the legacy SSE transport. Plenty of deployed servers are
+		// SSE-only, and a config written for another client often gives no
+		// type; they used to fail here with an HTTP error and no hint.
+		srv, err := connectTransport(ctx, name, &mcpsdk.StreamableClientTransport{Endpoint: url, HTTPClient: httpClient}, opts, el)
+		if err == nil || ctx.Err() != nil {
+			return srv, err
+		}
+		if sseSrv, sseErr := connectTransport(ctx, name, &mcpsdk.SSEClientTransport{Endpoint: url, HTTPClient: httpClient}, opts, el); sseErr == nil {
+			return sseSrv, nil
+		}
+		return nil, fmt.Errorf("%w (legacy SSE was tried too; set \"type\" to choose one)", err)
 	}
 	if strings.TrimSpace(cfg.Command) == "" {
 		return nil, fmt.Errorf("mcp %q: config has neither command (stdio) nor url (http)", name)
 	}
-	return ConnectCommand(ctx, name, cfg)
+	return connectCommand(ctx, name, cfg, opts, el)
 }
 
-// ConnectCommand spawns a stdio MCP server and connects to it.
-func ConnectCommand(ctx context.Context, name string, cfg ServerConfig) (*Server, error) {
+// ConnectCommand spawns a stdio MCP server and connects to it. A nil Elicitor
+// advertises no elicitation capability.
+func ConnectCommand(ctx context.Context, name string, cfg ServerConfig, el *Elicitor) (*Server, error) {
+	return connectCommand(ctx, name, cfg, nil, el)
+}
+
+func connectCommand(ctx context.Context, name string, cfg ServerConfig, opts *mcpsdk.ClientOptions, el *Elicitor) (*Server, error) {
 	cmd := exec.Command(cfg.Command, cfg.Args...)
 	cmd.Env = os.Environ()
 	for k, v := range cfg.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
-	return ConnectTransport(ctx, name, &mcpsdk.CommandTransport{Command: cmd})
+	stderr := newServerStderr(name)
+	cmd.Stderr = stderr
+	srv, err := connectTransport(ctx, name, &mcpsdk.CommandTransport{Command: cmd}, opts, el)
+	if err != nil {
+		// A failed connect has closed the transport and waited for the child,
+		// so its stderr has been drained: what it said is why it failed.
+		if tail := strings.TrimSpace(stderr.Tail()); tail != "" {
+			return nil, fmt.Errorf("%w — stderr:\n%s", err, tail)
+		}
+		return nil, err
+	}
+	return srv, nil
 }
 
 // ConnectTransport connects to a server over an arbitrary transport (used by
-// command servers and by tests via an in-memory transport).
-func ConnectTransport(ctx context.Context, name string, t mcpsdk.Transport) (*Server, error) {
-	session, err := newClient().Connect(ctx, t, nil)
+// command servers and by tests via an in-memory transport). A nil Elicitor
+// advertises no elicitation capability.
+func ConnectTransport(ctx context.Context, name string, t mcpsdk.Transport, el *Elicitor) (*Server, error) {
+	return connectTransport(ctx, name, t, nil, el)
+}
+
+func connectTransport(ctx context.Context, name string, t mcpsdk.Transport, opts *mcpsdk.ClientOptions, el *Elicitor) (*Server, error) {
+	session, err := newClient(name, opts, el).Connect(ctx, t, nil)
 	if err != nil {
 		return nil, fmt.Errorf("mcp %q connect: %w", name, err)
 	}
@@ -224,31 +467,172 @@ type Manager struct {
 	servers []*Server
 	cfg     Config
 	ctx     context.Context
+
+	// elicitor is handed to every client this manager builds, including the
+	// ones a reload or a revive builds, so a relaunched server keeps the
+	// ability to ask the user things. Nil in a headless run.
+	elicitor *Elicitor
+
+	// connectFn is how a server is launched, as a field so a test can relaunch
+	// one without a real binary on PATH. Nothing in production sets it; nil
+	// means connectServer with the Manager's client options.
+	connectFn func(ctx context.Context, name string, cfg ServerConfig, el *Elicitor) (*Server, error)
+
+	// onToolsChanged, when set, is called after a server sends
+	// notifications/tools/list_changed. It lets the host rebuild its tool
+	// registry from the server's fresh list without a config reload or restart.
+	// Guarded because it is set on the main goroutine but read from the MCP
+	// client's notification goroutine.
+	cbMu           sync.RWMutex
+	onToolsChanged func()
+}
+
+// SetToolsChangedHandler registers a callback invoked whenever a connected
+// server announces that its tool list changed (notifications/tools/list_changed).
+// The Manager itself holds no tool registry — Tools() always re-lists live — so
+// the handler's job is to rebuild whatever the host assembled from Tools().
+//
+// It is set once, after Connect, and applies to every server: the per-session
+// notification handler installed at connect time dispatches here, so a server
+// that reconnects (or one added by a later reload) is covered without re-arming.
+func (m *Manager) SetToolsChangedHandler(fn func()) {
+	m.cbMu.Lock()
+	m.onToolsChanged = fn
+	m.cbMu.Unlock()
+}
+
+// dispatchToolsChanged fans a server's list_changed notification out to the
+// registered handler, if any. It is called on the client's notification
+// goroutine.
+func (m *Manager) dispatchToolsChanged() {
+	m.cbMu.RLock()
+	fn := m.onToolsChanged
+	m.cbMu.RUnlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// clientOptions builds the per-session client options for a server: a
+// tools/list_changed handler that re-lists tools live through the Manager. The
+// handler closes over the Manager (not the server name) because a rebuild
+// re-lists every server anyway.
+func (m *Manager) clientOptions() *mcpsdk.ClientOptions {
+	return &mcpsdk.ClientOptions{
+		ToolListChangedHandler: func(context.Context, *mcpsdk.ToolListChangedRequest) {
+			m.dispatchToolsChanged()
+		},
+	}
+}
+
+// connect wires the Manager's client options into connectServer, so every
+// server the Manager brings up (at startup, on reconnect, or on reload) reports
+// tool-list changes back to the Manager.
+func (m *Manager) connect(ctx context.Context, name string, cfg ServerConfig) (*Server, error) {
+	return m.dial(ctx, name, cfg)
+}
+
+// dial launches one server through whatever connect is in force.
+func (m *Manager) dial(ctx context.Context, name string, cfg ServerConfig) (*Server, error) {
+	m.mu.RLock()
+	fn, el := m.connectFn, m.elicitor
+	m.mu.RUnlock()
+	if fn == nil {
+		return connectServer(ctx, name, cfg, m.clientOptions(), el)
+	}
+	return fn(ctx, name, cfg, el)
 }
 
 // Connect launches and connects every server in cfg. Servers that fail to
 // connect are skipped (with their error collected), so one bad server does not
 // abort startup.
-func Connect(ctx context.Context, cfg Config) (*Manager, []error) {
-	m := &Manager{cfg: cfg, ctx: ctx}
-	var errs []error
+//
+// Servers connect in parallel, each under connectTimeout. They used to connect
+// one after another with no deadline, so one server that never answered its
+// initialize held up startup indefinitely, and every server's start-up time
+// added to Klaudia's.
+//
+// A nil Elicitor means servers cannot ask the user anything, which is what a
+// headless run wants.
+func Connect(ctx context.Context, cfg Config, el *Elicitor) (*Manager, []error) {
+	m := &Manager{cfg: cfg, ctx: ctx, elicitor: el}
 	// Deterministic order for stable tool lists.
 	names := make([]string, 0, len(cfg.MCPServers))
 	for n := range cfg.MCPServers {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	for _, name := range names {
-		srv, err := connectServer(ctx, name, cfg.MCPServers[name])
-		if err != nil {
-			errs = append(errs, err)
+	servers := make([]*Server, len(names))
+	errs := make([]error, len(names))
+	var wg sync.WaitGroup
+	for i, name := range names {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			servers[i], errs[i] = m.connectWithDeadline(ctx, name, cfg.MCPServers[name])
+		}()
+	}
+	wg.Wait()
+	var failed []error
+	for i, name := range names {
+		if errs[i] != nil {
+			failed = append(failed, errs[i])
 			// Keep a disconnected placeholder so it can be reconnected later.
 			m.servers = append(m.servers, &Server{Name: name})
 			continue
 		}
-		m.servers = append(m.servers, srv)
+		m.servers = append(m.servers, servers[i])
 	}
-	return m, errs
+	return m, failed
+}
+
+// connectWithDeadline is m.connect bounded by connectTimeout. The session
+// outlives the deadline: it bounds the handshake, not the connection. It goes
+// through m.connect so the Manager's client options (tools/list_changed) are
+// wired into every session.
+//
+// The deadline is enforced with a timer that cancels the connect context if the
+// handshake has not finished in time, and is stopped the moment connect
+// returns. A plain `context.WithTimeout` + `defer cancel()` cannot be used: the
+// legacy SSE transport keeps its event stream on the connect context for the
+// session's whole life, so cancelling it once connect returns tears a
+// just-connected SSE server straight back down (streamable HTTP and stdio don't
+// care, which is why this only surfaced for SSE). On success the context's
+// release is handed to the parent instead, which ends when Klaudia does.
+func (m *Manager) connectWithDeadline(ctx context.Context, name string, cfg ServerConfig) (*Server, error) {
+	cctx, cancel := context.WithCancel(ctx)
+	timer := time.AfterFunc(connectTimeout(), cancel)
+	srv, err := m.connect(cctx, name, cfg)
+	timedOut := !timer.Stop() // Stop reports false when the timer already fired
+	if err != nil {
+		cancel()
+		if timedOut && ctx.Err() == nil {
+			return nil, fmt.Errorf("mcp %q: no answer within %s of starting (KLAUDIA_MCP_CONNECT_TIMEOUT): %w", name, connectTimeout(), err)
+		}
+		return nil, err
+	}
+	// Keep the session's context alive past the handshake; release it when the
+	// parent context is done rather than now.
+	context.AfterFunc(ctx, cancel)
+	return srv, nil
+}
+
+// connectTimeout is how long a server has to complete its handshake.
+func connectTimeout() time.Duration { return envSeconds("KLAUDIA_MCP_CONNECT_TIMEOUT", 30*time.Second) }
+
+// toolTimeout is how long one tool call may take on a server with cfg.
+func toolTimeout(cfg ServerConfig) time.Duration {
+	if cfg.Timeout > 0 {
+		return time.Duration(cfg.Timeout) * time.Second
+	}
+	return envSeconds("KLAUDIA_MCP_TOOL_TIMEOUT", 10*time.Minute)
+}
+
+func envSeconds(name string, def time.Duration) time.Duration {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name))); err == nil && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return def
 }
 
 // Add registers an already-connected server (used by tests).
@@ -292,6 +676,7 @@ func (m *Manager) Disconnect(name string) error {
 	if s == nil {
 		return fmt.Errorf("no such MCP server %q", name)
 	}
+	s.parked.Store(true)
 	if prev := s.swapSession(nil); prev != nil {
 		return prev.Close()
 	}
@@ -309,6 +694,7 @@ func (m *Manager) Reconnect(name string) error {
 	if !ok {
 		return fmt.Errorf("no launch config for MCP server %q", name)
 	}
+	s.parked.Store(false)
 	if prev := s.swapSession(nil); prev != nil {
 		_ = prev.Close()
 	}
@@ -316,7 +702,7 @@ func (m *Manager) Reconnect(name string) error {
 	// TUI runs this synchronously). On timeout the server stays disconnected.
 	ctx, cancel := context.WithTimeout(m.ctx, reconnectTimeout)
 	defer cancel()
-	fresh, err := connectServer(ctx, name, cfg)
+	fresh, err := m.connect(ctx, name, cfg)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("mcp %q: reconnect timed out after %s", name, reconnectTimeout)
@@ -375,7 +761,7 @@ func (m *Manager) Reload(ctx context.Context, cfg Config) []error {
 				_ = s.Close()
 			}
 		}
-		fresh, err := connectServer(ctx, name, sc)
+		fresh, err := m.connectWithDeadline(ctx, name, sc)
 		if err != nil {
 			errs = append(errs, err)
 			// Keep a disconnected placeholder, so /mcp can retry it by hand.
@@ -412,6 +798,47 @@ func (m *Manager) Reload(ctx context.Context, cfg Config) []error {
 // reconnectTimeout bounds a single /mcp reconnect attempt.
 const reconnectTimeout = 10 * time.Second
 
+// reviveCooldown is the minimum gap between automatic relaunches of one
+// server. A server that cannot start — a bad command, a missing binary — would
+// otherwise pay a full launch timeout on every tool call the model makes, which
+// turns one misconfigured entry into a stalled session.
+const reviveCooldown = 15 * time.Second
+
+// revive brings a server back if it has died, and reports whether a usable
+// session exists afterwards.
+//
+// This is what makes a crashed server recoverable without the user doing
+// anything. A stdio server whose child process exits keeps a non-nil
+// ClientSession — nothing nils it out — so until now the first sign was a tool
+// call failing, and the only cure was /mcp or a restart: editing .mcp.json did
+// not help, because a reload leaves an unchanged entry alone.
+//
+// The liveness probe comes first and decides everything. An ordinary call
+// error — bad arguments, a tool that does not exist — must not restart a
+// perfectly healthy server, so a relaunch happens only when the server has
+// actually stopped answering.
+func (m *Manager) revive(ctx context.Context, s *Server) bool {
+	if s == nil || s.parked.Load() {
+		return false
+	}
+	s.reviveMu.Lock()
+	defer s.reviveMu.Unlock()
+
+	// Re-probe under the lock: whoever held it before us may have already
+	// fixed this, and a second relaunch would kill the session they just made.
+	if s.alive(ctx) {
+		return true
+	}
+	if time.Since(s.lastRevive) < reviveCooldown {
+		return false
+	}
+	s.lastRevive = time.Now()
+	if err := m.Reconnect(s.Name); err != nil {
+		return false
+	}
+	return s.alive(ctx)
+}
+
 // livenessTimeout bounds the per-server health probe a reload runs before
 // deciding an unchanged server can be left alone. It is short because it is
 // paid for every surviving server on every reload, and a healthy stdio peer
@@ -439,4 +866,59 @@ func textOf(content []mcpsdk.Content) string {
 		}
 	}
 	return out
+}
+
+// redactValues replaces, in err's message, each resolved variable value with
+// its ${NAME} reference. Values shorter than four bytes are left alone: they
+// are rarely secrets and would match ordinary text. The original error stays
+// reachable through Unwrap for errors.Is.
+func redactValues(err error, resolved map[string]string) error {
+	msg := err.Error()
+	changed := false
+	names := make([]string, 0, len(resolved))
+	for k := range resolved {
+		names = append(names, k)
+	}
+	// Longest value first, so a value containing another is replaced whole.
+	sort.Slice(names, func(i, j int) bool { return len(resolved[names[i]]) > len(resolved[names[j]]) })
+	for _, k := range names {
+		v := resolved[k]
+		if len(v) < 4 || !strings.Contains(msg, v) {
+			continue
+		}
+		msg = strings.ReplaceAll(msg, v, "${"+k+"}")
+		changed = true
+	}
+	if !changed {
+		return err
+	}
+	return &redactedError{msg: msg, err: err}
+}
+
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.err }
+
+// headerTransport adds a server's configured headers to each request.
+type headerTransport struct {
+	base    http.RoundTripper
+	headers map[string]string
+}
+
+func (h headerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	for k, v := range h.headers {
+		r.Header.Set(k, v)
+	}
+	return h.base.RoundTrip(r)
+}
+
+// AlwaysLoad reports whether the named server's tools skip ToolSearch.
+func (m *Manager) AlwaysLoad(server string) bool {
+	cfg, ok := m.serverConfig(server)
+	return ok && cfg.AlwaysLoad
 }

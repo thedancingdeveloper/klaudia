@@ -1,10 +1,12 @@
 // Package session reads and writes Klaudia session transcripts:
-// newline-delimited JSON (JSONL) under ~/.klaudia/sessions/<encoded-cwd>/.
+// newline-delimited JSON (JSONL) under ~/.klaudia/sessions/<encoded-project-root>/.
 package session
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/greenthread-ai/klaudia/internal/config"
 )
 
 // maxDirLen is the project-dir name length cap before truncation+hash (q0A=200).
@@ -19,14 +23,14 @@ const maxDirLen = 200
 
 var nonAlnum = regexp.MustCompile(`[^a-zA-Z0-9]`)
 
-// ConfigRoot returns ~/.klaudia (honoring KLAUDIA_CONFIG_DIR).
+// ConfigRoot returns config.Root() — ~/.klaudia, honouring KLAUDIA_CONFIG_DIR.
+// When neither can be resolved it falls back to a relative ".klaudia", as it
+// always has, so callers that join paths under it never get a bare "sessions".
 func ConfigRoot() string {
-	base := os.Getenv("KLAUDIA_CONFIG_DIR")
-	if base == "" {
-		home, _ := os.UserHomeDir()
-		base = filepath.Join(home, ".klaudia")
+	if root := config.Root(); root != "" {
+		return root
 	}
-	return base
+	return ".klaudia"
 }
 
 // SessionsRoot returns ~/.klaudia/sessions (honoring KLAUDIA_CONFIG_DIR).
@@ -91,10 +95,57 @@ func ExistingPath(cwd, sessionID string) string {
 	}
 }
 
+// validID is the shape of a session id an embedder may choose: a single safe
+// filename component. Minted ids are UUIDs, which match.
+var validID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+
+// ValidID reports whether id is usable as a session id. The id becomes a file
+// name under the sessions root, so anything that could name another path
+// ("..", a separator, a dot-suffix like ".summary") is rejected.
+func ValidID(id string) bool { return validID.MatchString(id) }
+
+// Locate finds the transcript for a session id. The copy for cwd is preferred
+// (as ExistingPath chooses it); failing that, every project dir under the
+// sessions root and the legacy projects root is searched, so a session can be
+// resumed from a different working directory — or on another host, once its
+// sessions root has been copied under KLAUDIA_CONFIG_DIR. When several dirs
+// hold the id, the most recently written copy wins. It returns ("", false)
+// when no transcript exists for the id, or the id is not ValidID.
+func Locate(cwd, sessionID string) (string, bool) {
+	if !ValidID(sessionID) {
+		return "", false
+	}
+	if p := ExistingPath(cwd, sessionID); fileExists(p) {
+		return p, true
+	}
+	var matches []string
+	for _, root := range []string{SessionsRoot(), legacyProjectsRoot()} {
+		m, _ := filepath.Glob(filepath.Join(root, "*", sessionID+".jsonl"))
+		matches = append(matches, m...)
+	}
+	best, bestMod := "", time.Time{}
+	for _, m := range matches {
+		st, err := os.Stat(m)
+		if err != nil || !st.Mode().IsRegular() {
+			continue
+		}
+		if best == "" || st.ModTime().After(bestMod) {
+			best, bestMod = m, st.ModTime()
+		}
+	}
+	return best, best != ""
+}
+
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.Mode().IsRegular()
+}
+
 // Entry is one transcript line. Field names/tags match the JS schema; optional
 // fields are omitted when empty so output stays close to the reference.
 type Entry struct {
-	Type        string          `json:"type"` // "user" | "assistant"
+	Type        string          `json:"type"`              // "user" | "assistant" | "system"
+	Subtype     string          `json:"subtype,omitempty"` // system-only, e.g. "compact_boundary"
 	UUID        string          `json:"uuid"`
 	ParentUUID  *string         `json:"parentUuid"`
 	SessionID   string          `json:"sessionId"`
@@ -110,6 +161,11 @@ type Entry struct {
 	PermissionMode string `json:"permissionMode,omitempty"`
 	// assistant-only
 	RequestID string `json:"requestId,omitempty"`
+
+	// Build is Klaudia's own build (version.Info.Summary). A Klaudia
+	// addition: "version" stays the reference-compatible string readers
+	// expect, so the build that wrote a transcript needs a field of its own.
+	Build string `json:"klaudiaBuild,omitempty"`
 }
 
 // Now returns an RFC3339 millisecond UTC timestamp matching the JS format
@@ -133,6 +189,13 @@ type Writer struct {
 // constructing a writer (and never appending) never leaves a file on disk.
 func NewWriter(cwd, sessionID string) (*Writer, error) {
 	return &Writer{path: Path(cwd, sessionID)}, nil
+}
+
+// NewWriterAt prepares a transcript writer that appends to an explicit path —
+// the located transcript of a session resumed from another directory, so its
+// history stays in one file rather than splitting across project dirs.
+func NewWriterAt(path string) *Writer {
+	return &Writer{path: path}
 }
 
 // open creates the parent dir and opens the file for append on first use.
@@ -187,31 +250,62 @@ func Read(path string) ([]Entry, error) {
 	defer f.Close()
 
 	var entries []Entry
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
+	err = eachLine(f, func(line []byte) bool {
 		var e Entry
 		if err := json.Unmarshal(line, &e); err != nil {
-			continue // tolerate malformed/unknown lines
+			return true // tolerate malformed/unknown lines
 		}
 		if e.Type == "user" || e.Type == "assistant" {
 			entries = append(entries, e)
 		}
+		return true
+	})
+	return entries, err
+}
+
+// eachLine calls fn with each non-empty line of r until fn returns false.
+//
+// It has no line-length limit. A bufio.Scanner capped at 16 MB stopped at the
+// first longer line — one image tool result is enough — and Read returned the
+// history up to that point, so a resumed session quietly lost everything after
+// it.
+func eachLine(r io.Reader, fn func([]byte) bool) error {
+	br := bufio.NewReaderSize(r, 64*1024)
+	for {
+		line, err := br.ReadBytes('\n')
+		if trimmed := bytes.TrimRight(line, "\r\n"); len(trimmed) > 0 {
+			if !fn(trimmed) {
+				return nil
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 	}
-	return entries, sc.Err()
 }
 
 // MostRecent returns the session ID of the most recently modified transcript in
-// the project dir for cwd, or ("", false) if none exists. The current sessions
-// root and legacy projects root are both considered during migration.
-func MostRecent(cwd string) (string, bool) {
-	matches, _ := filepath.Glob(filepath.Join(Dir(cwd), "*.jsonl"))
-	legacyMatches, _ := filepath.Glob(filepath.Join(legacyDir(cwd), "*.jsonl"))
-	matches = append(matches, legacyMatches...)
+// the project dirs for the given directories, or ("", false) if none exists.
+// The first directory is the project's own key; any others are read as well,
+// so transcripts recorded under an older key (the launch directory, before
+// sessions were keyed by the project root) are still picked up. The current
+// sessions root and legacy projects root are both considered during migration.
+func MostRecent(dirs ...string) (string, bool) {
+	var matches []string
+	seen := map[string]bool{}
+	for _, d := range dirs {
+		if seen[d] {
+			continue
+		}
+		seen[d] = true
+		m, _ := filepath.Glob(filepath.Join(Dir(d), "*.jsonl"))
+		legacyMatches, _ := filepath.Glob(filepath.Join(legacyDir(d), "*.jsonl"))
+		matches = append(matches, m...)
+		matches = append(matches, legacyMatches...)
+	}
 	if len(matches) == 0 {
 		return "", false
 	}
@@ -246,29 +340,34 @@ func MostRecent(cwd string) (string, bool) {
 	return "", false
 }
 
-// hasMessages reports whether a transcript holds at least one user/assistant
-// message, scanning only until the first match so large transcripts stay cheap.
-// A file with only non-message lines (or none) is treated as contentless.
+// hasMessagesFrom reports whether a transcript holds a user/assistant message
+// and was recorded in cwd, scanning only to the first message so large
+// transcripts stay cheap. A file with only non-message lines (or none) is
+// treated as contentless.
+//
+// The cwd check is needed because EncodePath maps every non-alphanumeric
+// character to "-": /a/my_proj, /a/my-proj and /a/my.proj share one directory.
+// Auto-resume picked the newest transcript there, so starting Klaudia in one
+// of them resumed a conversation from another. A message with no recorded cwd
+// (older transcripts, imports) is accepted, as it was before.
 func hasMessages(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
 		return false
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
-		if len(sc.Bytes()) == 0 {
-			continue
-		}
+	found := false
+	_ = eachLine(f, func(line []byte) bool {
 		var e struct {
 			Type string `json:"type"`
 		}
-		if json.Unmarshal(sc.Bytes(), &e) == nil && (e.Type == "user" || e.Type == "assistant") {
+		if json.Unmarshal(line, &e) != nil || (e.Type != "user" && e.Type != "assistant") {
 			return true
 		}
-	}
-	return false
+		found = true
+		return false
+	})
+	return found
 }
 
 // LastTurnRefused reports whether the transcript's final assistant turn was a

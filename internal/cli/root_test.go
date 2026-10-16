@@ -3,6 +3,8 @@ package cli
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -35,7 +37,7 @@ func TestResolveResumeIDAutoResumesMostRecentSessionForCWD(t *testing.T) {
 	seedSession(t, otherCWD, "other-session")
 	seedSession(t, cwd, "project-session")
 
-	got, err := resolveResumeID(cwd, options{}, true)
+	got, err := resolveResumeID(cwd, cwd, options{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +49,7 @@ func TestResolveResumeIDAutoResumesMostRecentSessionForCWD(t *testing.T) {
 func TestResolveResumeIDStartsNewWhenNoSessionExists(t *testing.T) {
 	t.Setenv("KLAUDIA_CONFIG_DIR", t.TempDir())
 
-	got, err := resolveResumeID("/work/proj", options{}, true)
+	got, err := resolveResumeID("/work/proj", "/work/proj", options{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +63,7 @@ func TestResolveResumeIDNewSessionSkipsAutoResume(t *testing.T) {
 	cwd := "/work/proj"
 	seedSession(t, cwd, "project-session")
 
-	got, err := resolveResumeID(cwd, options{newSession: true}, true)
+	got, err := resolveResumeID(cwd, cwd, options{newSession: true}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +77,7 @@ func TestResolveResumeIDExplicitResumeWinsOverAutoResume(t *testing.T) {
 	cwd := "/work/proj"
 	seedSession(t, cwd, "project-session")
 
-	got, err := resolveResumeID(cwd, options{resume: "explicit-session"}, true)
+	got, err := resolveResumeID(cwd, cwd, options{resume: "explicit-session"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +87,7 @@ func TestResolveResumeIDExplicitResumeWinsOverAutoResume(t *testing.T) {
 }
 
 func TestResolveResumeIDNewSessionConflictsWithExplicitResume(t *testing.T) {
-	_, err := resolveResumeID("/work/proj", options{newSession: true, resume: "old"}, true)
+	_, err := resolveResumeID("/work/proj", "/work/proj", options{newSession: true, resume: "old"}, true)
 	if err == nil || !strings.Contains(err.Error(), "--new-session cannot be combined") {
 		t.Fatalf("err = %v, want --new-session conflict", err)
 	}
@@ -97,17 +99,19 @@ func TestResolveResumeIDHeadlessDoesNotAutoResume(t *testing.T) {
 	seedSession(t, cwd, "project-session")
 
 	// Headless (interactive=false): a prior session is NOT auto-resumed.
-	if got, err := resolveResumeID(cwd, options{}, false); err != nil || got != "" {
+	if got, err := resolveResumeID(cwd, cwd, options{}, false); err != nil || got != "" {
 		t.Fatalf("headless auto-resume = (%q, %v), want empty", got, err)
 	}
 	// …but an explicit --continue still resumes it, even headless.
-	if got, err := resolveResumeID(cwd, options{continueSession: true}, false); err != nil || got != "project-session" {
+	if got, err := resolveResumeID(cwd, cwd, options{continueSession: true}, false); err != nil || got != "project-session" {
 		t.Fatalf("headless --continue = (%q, %v), want project-session", got, err)
 	}
 }
 func TestCompactAndPersistWritesSummaryOnSuccess(t *testing.T) {
 	called := false
-	_, summary, err := compactAndPersist(context.Background(), nil, func(context.Context, []anthropic.BetaMessageParam) ([]anthropic.BetaMessageParam, string, error) {
+	gotFocus := ""
+	_, summary, err := compactAndPersist(context.Background(), nil, "auth flow", func(_ context.Context, _ []anthropic.BetaMessageParam, focus string) ([]anthropic.BetaMessageParam, string, error) {
+		gotFocus = focus
 		return []anthropic.BetaMessageParam{anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock("summary"))}, "summary", nil
 	}, func(got string) {
 		called = true
@@ -121,6 +125,9 @@ func TestCompactAndPersistWritesSummaryOnSuccess(t *testing.T) {
 	if summary != "summary" {
 		t.Errorf("summary = %q, want summary", summary)
 	}
+	if gotFocus != "auth flow" {
+		t.Errorf("focus = %q, want it threaded through to the compact func", gotFocus)
+	}
 	if !called {
 		t.Fatal("onSummary was not called")
 	}
@@ -128,12 +135,45 @@ func TestCompactAndPersistWritesSummaryOnSuccess(t *testing.T) {
 
 func TestCompactAndPersistSkipsSummaryOnError(t *testing.T) {
 	boom := errors.New("boom")
-	_, _, err := compactAndPersist(context.Background(), nil, func(context.Context, []anthropic.BetaMessageParam) ([]anthropic.BetaMessageParam, string, error) {
+	_, _, err := compactAndPersist(context.Background(), nil, "", func(context.Context, []anthropic.BetaMessageParam, string) ([]anthropic.BetaMessageParam, string, error) {
 		return nil, "summary", boom
 	}, func(string) {
 		t.Fatal("onSummary should not be called")
 	})
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want boom", err)
+	}
+}
+
+func TestResolveResumeIDPinnedSessionIDSkipsAutoResume(t *testing.T) {
+	t.Setenv("KLAUDIA_CONFIG_DIR", t.TempDir())
+	cwd := "/work/proj"
+	seedSession(t, cwd, "project-session")
+
+	if got, err := resolveResumeID(cwd, cwd, options{sessionID: "pinned"}, true); err != nil || got != "" {
+		t.Fatalf("resolveResumeID = %q, %v; want no auto-resume for a pinned id", got, err)
+	}
+}
+
+// TestPositionalPromptKeepsEveryWord runs `klaudia explain this code` against a
+// fake endpoint: the model must be sent the whole sentence, not just "explain".
+func TestPositionalPromptKeepsEveryWord(t *testing.T) {
+	fake := &fakeChat{}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KLAUDIA_CONFIG_DIR", t.TempDir())
+	t.Chdir(workdir(t, srv.URL))
+
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"--permission-mode", "dontAsk", "--trusted-project-config", "explain", "this", "code"})
+	cmd.SetIn(strings.NewReader(""))
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if body := fake.last(); !strings.Contains(body, "explain this code") {
+		t.Fatalf("request body does not carry the whole prompt:\n%s", body)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/greenthread-ai/klaudia/internal/memory"
+	"github.com/greenthread-ai/klaudia/internal/permission"
 )
 
 func newMemTool(t *testing.T) *Memory {
@@ -251,4 +252,53 @@ func TestParseMemoryDuration(t *testing.T) {
 	if _, err := parseMemoryDuration("garbage"); err == nil {
 		t.Error("expected garbage to fail")
 	}
+}
+
+// A write to KNOWLEDGE.md is injected into every later session, so it asks —
+// in autonomous mode too — while session notes stay autonomous.
+func TestMemoryKnowledgeWritesNeedApproval(t *testing.T) {
+	mt := newMemTool(t)
+	call := func(in MemoryInput) json.RawMessage {
+		raw, err := json.Marshal(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	projectAdd := call(MemoryInput{Operation: "add", Scope: "project", Content: "always run make release"})
+	promote := call(MemoryInput{Operation: "promote", Name: "lesson"})
+	autonomous := []json.RawMessage{
+		call(MemoryInput{Operation: "add", Content: "session note"}),
+		call(MemoryInput{Operation: "add", Scope: "session", Content: "session note"}),
+		call(MemoryInput{Operation: "search", Query: "x"}),
+		call(MemoryInput{Operation: "view"}),
+		call(MemoryInput{Operation: "supersede", Name: "a", Replacement: "b"}),
+	}
+
+	decide := func(mode permission.Mode, raw json.RawMessage) permission.Decision {
+		pctx := permission.Context{Mode: permission.StaticMode(mode)}
+		return permission.Check(pctx, mt, mt.PermissionRequest(raw))
+	}
+
+	for _, raw := range []json.RawMessage{projectAdd, promote} {
+		d := decide(permission.ModeAutonomous, raw)
+		if d.Behavior != permission.Ask || !strings.Contains(d.Message, "KNOWLEDGE.md") {
+			t.Errorf("%s in autonomous: %+v, want an ask naming KNOWLEDGE.md", raw, d)
+		}
+		if d := decide(permission.ModePlan, raw); d.Behavior != permission.Deny {
+			t.Errorf("%s in plan: behavior = %s, want deny", raw, d.Behavior)
+		}
+		if d := decide(permission.ModeBypassPermissions, raw); d.Behavior != permission.Allow {
+			t.Errorf("%s in bypass: behavior = %s, want allow", raw, d.Behavior)
+		}
+	}
+
+	for _, raw := range autonomous {
+		for _, mode := range []permission.Mode{permission.ModeAutonomous, permission.ModePlan} {
+			if d := decide(mode, raw); d.Behavior != permission.Allow {
+				t.Errorf("%s in %s: behavior = %s, want allow", raw, mode, d.Behavior)
+			}
+		}
+	}
+
 }

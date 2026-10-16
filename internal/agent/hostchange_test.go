@@ -31,7 +31,7 @@ func TestDeclareOnceThenSilence(t *testing.T) {
 	opts := Options{
 		WorkingDir: proj,
 		Host:       g,
-		Permission: permission.Context{Mode: permission.StaticMode(permission.ModeDefault)},
+		Permission: permission.Context{Mode: permission.StaticMode(permission.ModeAutonomous)},
 		Approver: ApproverFunc(func(ctx context.Context, req ApprovalRequest) permission.Decision {
 			asked++
 			card = req.HostChange
@@ -41,8 +41,8 @@ func TestDeclareOnceThenSilence(t *testing.T) {
 	run := func(name string, input any) string {
 		raw, _ := json.Marshal(input)
 		tu := anthropic.BetaToolUseBlock{ID: "t", Name: name, Input: json.RawMessage(raw)}
-		return resultText(l.dispatch(context.Background(), tu, opts, nil, nil,
-			map[string]int{}, map[string]errStreak{}))
+		return resultText(l.dispatch(context.Background(), tu, opts, 0, nil, nil,
+			newFailureState()))
 	}
 
 	out := run("RequestHostChange", map[string]any{
@@ -97,7 +97,7 @@ func TestDriftAsksAgainAndSaysSo(t *testing.T) {
 	opts := Options{
 		WorkingDir: proj,
 		Host:       g,
-		Permission: permission.Context{Mode: permission.StaticMode(permission.ModeDefault)},
+		Permission: permission.Context{Mode: permission.StaticMode(permission.ModeAutonomous)},
 		Approver: ApproverFunc(func(ctx context.Context, req ApprovalRequest) permission.Decision {
 			cards = append(cards, req.HostChange)
 			return permission.Decision{Behavior: permission.Allow}
@@ -106,8 +106,8 @@ func TestDriftAsksAgainAndSaysSo(t *testing.T) {
 	run := func(name string, input any) string {
 		raw, _ := json.Marshal(input)
 		tu := anthropic.BetaToolUseBlock{ID: "t", Name: name, Input: json.RawMessage(raw)}
-		return resultText(l.dispatch(context.Background(), tu, opts, nil, nil,
-			map[string]int{}, map[string]errStreak{}))
+		return resultText(l.dispatch(context.Background(), tu, opts, 0, nil, nil,
+			newFailureState()))
 	}
 
 	run("RequestHostChange", map[string]any{
@@ -143,7 +143,7 @@ func TestDeclinedDeclarationDoesNotMintAGrant(t *testing.T) {
 	opts := Options{
 		WorkingDir: proj,
 		Host:       g,
-		Permission: permission.Context{Mode: permission.StaticMode(permission.ModeDefault)},
+		Permission: permission.Context{Mode: permission.StaticMode(permission.ModeAutonomous)},
 		Approver: ApproverFunc(func(ctx context.Context, req ApprovalRequest) permission.Decision {
 			return permission.Decision{Behavior: permission.Deny}
 		}),
@@ -153,7 +153,7 @@ func TestDeclinedDeclarationDoesNotMintAGrant(t *testing.T) {
 	})
 	body := resultText(l.dispatch(context.Background(),
 		anthropic.BetaToolUseBlock{ID: "t", Name: "RequestHostChange", Input: json.RawMessage(raw)},
-		opts, nil, nil, map[string]int{}, map[string]errStreak{}))
+		opts, 0, nil, nil, newFailureState()))
 
 	if !strings.Contains(body, "declined") {
 		t.Fatalf("result did not report the decline: %s", body)
@@ -313,5 +313,161 @@ func TestApprovedDeclarationIsNotRecordedAsBlocked(t *testing.T) {
 		if r.Enforced {
 			t.Errorf("an approved change was recorded as blocked: %+v", r)
 		}
+	}
+}
+
+// #305: an approved scope covers the same paths when the command reaches them
+// over ssh, in a combined remote script, or through docker exec on that host —
+// the in-scope delete runs, while a path outside the scope, the scope root
+// itself and a bulk delete are still refused.
+func TestApprovedScopeCoversRemoteSpelledPaths(t *testing.T) {
+	g, proj := gateFixture(t)
+	g.DeclareTool = "RequestHostChange"
+	declare, err := tools.NewRequestHostChange()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, bash := testRegistry(t, declare)
+	l := New(nil, reg)
+
+	asked := 0
+	opts := Options{
+		WorkingDir: proj,
+		Host:       g,
+		Permission: permission.Context{Mode: permission.StaticMode(permission.ModeAutonomous)},
+		Approver: ApproverFunc(func(ctx context.Context, req ApprovalRequest) permission.Decision {
+			asked++
+			return permission.Decision{Behavior: permission.Allow}
+		}),
+	}
+	run := func(name string, input any) string {
+		raw, _ := json.Marshal(input)
+		tu := anthropic.BetaToolUseBlock{ID: "t", Name: name, Input: json.RawMessage(raw)}
+		return resultText(l.dispatch(context.Background(), tu, opts, 0, nil, nil,
+			newFailureState()))
+	}
+	const inScope = "ssh root@winrarhost 'rm -f /mnt/2tnvme/docker/volumes/z2m_data/.mqttpw'"
+
+	// Before any approval the remote delete is put to the user, and the
+	// refusal names the host it lands on, not this machine.
+	body := run("Bash", map[string]string{"command": inScope})
+	if !strings.Contains(body, "RequestHostChange") {
+		t.Fatalf("an unapproved remote delete ran: %s", body)
+	}
+	if !strings.Contains(body, "root@winrarhost") || strings.Contains(body, "this machine") {
+		t.Errorf("refusal should name the remote host: %s", body)
+	}
+
+	out := run("RequestHostChange", map[string]any{
+		"summary": "Delete two leftover MQTT password scratch files",
+		"reason":  "they hold a plaintext password",
+		"paths":   []string{"/mnt/2tnvme/docker/volumes/z2m_data/.mqttpw", "/tmp/z2m_mqtt_pw"},
+	})
+	if !strings.Contains(out, "Approved") {
+		t.Fatalf("declaration was not approved: %s", out)
+	}
+
+	before := len(bash.ran)
+	for _, cmd := range []string{
+		inScope,
+		"ssh root@winrarhost rm -f /mnt/2tnvme/docker/volumes/z2m_data/.mqttpw",
+		"ssh root@winrarhost 'rm -f /mnt/2tnvme/docker/volumes/z2m_data/.mqttpw; docker exec mosquitto rm -f /tmp/z2m_mqtt_pw'",
+		"ssh root@winrarhost docker exec mosquitto rm -f /tmp/z2m_mqtt_pw",
+		"ssh -p 22 root@winrarhost 'rm -f /tmp/z2m_mqtt_pw && ls /mnt/2tnvme/docker/volumes/z2m_data'",
+	} {
+		if body := run("Bash", map[string]string{"command": cmd}); strings.Contains(body, "RequestHostChange") {
+			t.Errorf("%q was refused inside the approved scope: %s", cmd, body)
+		}
+	}
+	if got := len(bash.ran) - before; got != 5 {
+		t.Fatalf("ran %d of 5 in-scope commands: %v", got, bash.ran)
+	}
+
+	for _, cmd := range []string{
+		// Outside the scope.
+		"ssh root@winrarhost 'rm -f /mnt/2tnvme/docker/volumes/other/x'",
+		"ssh root@winrarhost 'rm -f /etc/passwd'",
+		// The scope root itself: a grant changes what is inside it.
+		"ssh root@winrarhost 'rm -rf /mnt/2tnvme/docker/volumes/z2m_data'",
+		// Not spelled out: a variable, ~. (A relative path after a remote cd
+		// produces no effect at all and is not gated, before or after #305.)
+		"ssh root@winrarhost 'rm -f $F'",
+		"ssh root@winrarhost 'rm -f ~/.mqttpw'",
+		// In scope but bundled with an out-of-scope delete.
+		"ssh root@winrarhost 'rm -f /mnt/2tnvme/docker/volumes/z2m_data/.mqttpw /var/lib/other'",
+		// A local word dropped from the remote script: it runs, unread.
+		`ssh root@winrarhost rm -f /mnt/2tnvme/docker/volumes/z2m_data/x "$X"`,
+		"ssh root@winrarhost rm -f /mnt/2tnvme/docker/volumes/z2m_data/x $(cat /tmp/l)",
+		`ssh root@winrarhost 'rm -f /mnt/2tnvme/docker/volumes/z2m_data/x' "$Y"`,
+		// Brace expansion and globs the remote shell rewrites past the scope.
+		"ssh root@winrarhost 'rm -f /mnt/2tnvme/docker/volumes/z2m_data/.{.,}/.{.,}/.{.,}/etc/shadow'",
+		"ssh root@winrarhost 'rm -f /mnt/2tnvme/docker/volumes/z2m_data/*'",
+		// This machine under another name.
+		"ssh localhost 'rm -f /mnt/2tnvme/docker/volumes/z2m_data/.mqttpw'",
+		"ssh root@127.0.0.1 'rm -f /tmp/z2m_mqtt_pw'",
+		// A recursive delete of a path the user named.
+		"ssh root@winrarhost 'rm -rf /tmp/z2m_mqtt_pw'",
+		"ssh root@winrarhost 'rm -Rf /tmp/z2m_mqtt_pw'",
+		"ssh root@winrarhost 'rm --rec -f /tmp/z2m_mqtt_pw'",
+		"ssh root@winrarhost 'rm --recursiv /tmp/z2m_mqtt_pw'",
+		// A link in the scope that points out of it.
+		"ssh root@winrarhost 'ln -s / /mnt/2tnvme/docker/volumes/z2m_data/r'",
+		// Arguments appended at run time.
+		"ssh root@winrarhost 'xargs -a /tmp/list rm -f /mnt/2tnvme/docker/volumes/z2m_data/x'",
+		"ssh root@winrarhost '/usr/bin/xargs -a /tmp/l rm -f /mnt/2tnvme/docker/volumes/z2m_data/x'",
+		// Writes through a remote scope are never covered: a write can plant
+		// a link that takes a later in-scope path anywhere.
+		"ssh root@winrarhost 'cp -s /etc/shadow /mnt/2tnvme/docker/volumes/z2m_data/r'",
+		"ssh root@winrarhost 'mv /tmp/lnk /mnt/2tnvme/docker/volumes/z2m_data/r'",
+		"ssh root@winrarhost 'tee /mnt/2tnvme/docker/volumes/z2m_data/r </dev/null'",
+	} {
+		if body := run("Bash", map[string]string{"command": cmd}); !strings.Contains(body, "RequestHostChange") {
+			t.Errorf("%q ran outside the approved scope: %s", cmd, body)
+		}
+	}
+	if asked != 1 {
+		t.Errorf("asked %d times; one declaration should have been enough", asked)
+	}
+}
+
+// #305 review: approving a change on another host at the drift card must not
+// mint a grant that then covers this machine, and a scope the user named for
+// configuration must not authorise deleting that directory recursively.
+func TestRemoteApprovalDoesNotGrantThisMachine(t *testing.T) {
+	g, proj := gateFixture(t)
+	approved := 0
+	reg, _ := testRegistry(t)
+	l := New(nil, reg)
+	opts := Options{
+		WorkingDir: proj,
+		Host:       g,
+		Permission: permission.Context{Mode: permission.StaticMode(permission.ModeAutonomous)},
+		Approver: ApproverFunc(func(ctx context.Context, req ApprovalRequest) permission.Decision {
+			approved++
+			return permission.Decision{Behavior: permission.Allow}
+		}),
+	}
+	run := func(cmd string) string {
+		raw, _ := json.Marshal(map[string]string{"command": cmd})
+		tu := anthropic.BetaToolUseBlock{ID: "t", Name: "Bash", Input: json.RawMessage(raw)}
+		return resultText(l.dispatch(context.Background(), tu, opts, 0, nil, nil,
+			newFailureState()))
+	}
+	run("ssh root@winrarhost 'rm -f /opt/stack/data/old.db'")
+	if approved != 1 {
+		t.Fatalf("the remote delete was not put to the user (asked %d)", approved)
+	}
+	if n := len(g.Ledger.List()); n != 0 {
+		t.Fatalf("approving a remote delete minted %d grant(s)", n)
+	}
+
+	l2 := trust.NewLedger(trust.NewRoots(t.TempDir(), t.TempDir()))
+	if _, err := l2.Mint(trust.Request{Summary: "configure nginx", Paths: []string{"/etc/nginx"}}); err != nil {
+		t.Fatal(err)
+	}
+	rmrf := trust.Effect{Zone: trust.ZoneHost, Kind: trust.KindDelete, Recursive: true, Certain: true,
+		Res: trust.Resource{Class: "path", ID: "/etc/nginx"}}
+	if _, drift := l2.Cover([]trust.Effect{rmrf}); len(drift) == 0 {
+		t.Error("a named scope let rm -rf delete the directory itself")
 	}
 }

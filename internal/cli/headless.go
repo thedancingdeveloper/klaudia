@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+
+	"github.com/greenthread-ai/klaudia/internal/agent"
 )
 
 // OutputFormat selects how headless results are rendered to stdout.
@@ -35,18 +37,21 @@ func ParseOutputFormat(s string) (OutputFormat, error) {
 // and JSON tags match the JS bundle (07-app-features.js:33746) so JSON output
 // is byte-compatible after timestamp/UUID normalization.
 type ResultMessage struct {
-	Type          string         `json:"type"` // always "result"
-	Subtype       string         `json:"subtype"`
-	IsError       bool           `json:"is_error"`
-	DurationMS    int64          `json:"duration_ms"`
-	DurationAPIMS int64          `json:"duration_api_ms"`
-	NumTurns      int            `json:"num_turns"`
-	Result        string         `json:"result"`
-	StopReason    string         `json:"stop_reason,omitempty"`
-	SessionID     string         `json:"session_id"`
-	TotalCostUSD  float64        `json:"total_cost_usd"`
-	Usage         map[string]any `json:"usage,omitempty"`
-	UUID          string         `json:"uuid"`
+	Type          string `json:"type"` // always "result"
+	Subtype       string `json:"subtype"`
+	IsError       bool   `json:"is_error"`
+	DurationMS    int64  `json:"duration_ms"`
+	DurationAPIMS int64  `json:"duration_api_ms"`
+	NumTurns      int    `json:"num_turns"`
+	Result        string `json:"result"`
+	StopReason    string `json:"stop_reason,omitempty"`
+	// TrailOffNudges counts the replies the run refused to end on because
+	// they only announced a next step (agent.Result.TrailOffNudges).
+	TrailOffNudges int            `json:"trail_off_nudges,omitempty"`
+	SessionID      string         `json:"session_id"`
+	TotalCostUSD   float64        `json:"total_cost_usd"`
+	Usage          map[string]any `json:"usage,omitempty"`
+	UUID           string         `json:"uuid"`
 }
 
 // Renderer writes headless output in the configured format.
@@ -67,6 +72,19 @@ func (r *Renderer) Event(ev any) error {
 		return nil
 	}
 	return r.writeJSONLine(ev)
+}
+
+// withNotices also writes notice events to w (stderr) as "note: …" lines.
+// The text and json formats drop intermediate events and stream-json -p does
+// not use them, but a turn moving to the fallback model is something the
+// person running the command should hear about whatever the format.
+func withNotices(emit agent.Emitter, w io.Writer) agent.Emitter {
+	return func(ev agent.Event) {
+		if ev.Type == "notice" && ev.Content != "" {
+			_, _ = fmt.Fprintln(w, "note:", ev.Content)
+		}
+		emit(ev)
+	}
 }
 
 // Result emits the terminal result in the configured format:
@@ -92,4 +110,12 @@ func (r *Renderer) writeJSONLine(v any) error {
 	}
 	_, err = fmt.Fprintln(r.w, string(b))
 	return err
+}
+
+// warnOn writes a warning event to stderr for the formats that show no
+// events (text and json); stream-json carries it as an event line already.
+func warnOn(w io.Writer, format OutputFormat, ev agent.Event) {
+	if ev.Type == "warning" && format != FormatStreamJSON {
+		fmt.Fprintln(w, "warning:", ev.Content)
+	}
 }

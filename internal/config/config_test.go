@@ -3,7 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func writeConfig(t *testing.T, dir, body string) {
@@ -17,9 +20,18 @@ func writeConfig(t *testing.T, dir, body string) {
 	}
 }
 
+// trust puts dir on the trust list, so its project config applies in full.
+func trust(t *testing.T, dir string) {
+	t.Helper()
+	if _, err := TrustProject(dir); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLoadProjectOverridesHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "")
 	writeConfig(t, home, `provider = "anthropic"
 model = "sonnet"
 `)
@@ -28,8 +40,9 @@ model = "sonnet"
 	writeConfig(t, cwd, `provider = "openai"
 baseURL = "https://x/v1"
 `)
+	trust(t, cwd)
 
-	cfg := Load(cwd)
+	cfg := mustLoad(t, cwd)
 	if cfg.Provider != "openai" {
 		t.Errorf("provider = %q, want openai (project wins)", cfg.Provider)
 	}
@@ -42,37 +55,76 @@ baseURL = "https://x/v1"
 	}
 }
 
+func TestLoadFallbackModelProjectOverridesHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
+	writeConfig(t, home, `fallbackModel = "haiku"`)
+
+	if cfg := mustLoad(t, t.TempDir()); cfg.FallbackModel != "haiku" {
+		t.Errorf("fallbackModel = %q, want haiku (from home)", cfg.FallbackModel)
+	}
+	cwd := t.TempDir()
+	writeConfig(t, cwd, `fallbackModel = "sonnet"`)
+	if cfg := mustLoad(t, cwd); cfg.FallbackModel != "sonnet" {
+		t.Errorf("fallbackModel = %q, want sonnet (project wins)", cfg.FallbackModel)
+	}
+}
+
 func TestLoadThemeProjectOverridesHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "")
 	writeConfig(t, home, `theme = "nord"`)
 
 	// Global-only: inherited.
-	if cfg := Load(t.TempDir()); cfg.Theme != "nord" {
+	if cfg := mustLoad(t, t.TempDir()); cfg.Theme != "nord" {
 		t.Errorf("theme = %q, want nord (from home)", cfg.Theme)
 	}
 
 	// Project overrides global.
 	cwd := t.TempDir()
 	writeConfig(t, cwd, `theme = "dracula"`)
-	if cfg := Load(cwd); cfg.Theme != "dracula" {
+	trust(t, cwd)
+	if cfg := mustLoad(t, cwd); cfg.Theme != "dracula" {
 		t.Errorf("theme = %q, want dracula (project wins)", cfg.Theme)
+	}
+}
+
+func TestLoadTUINotifyOverridesHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
+	writeConfig(t, home, "[tui]\nnotify = \"bell\"\n")
+
+	// Global-only: inherited.
+	if cfg := mustLoad(t, t.TempDir()); cfg.TUI.Notify != "bell" {
+		t.Errorf("tui.notify = %q, want bell (from home)", cfg.TUI.Notify)
+	}
+
+	// Project overrides global.
+	cwd := t.TempDir()
+	writeConfig(t, cwd, "[tui]\nnotify = \"off\"\n")
+	if cfg := mustLoad(t, cwd); cfg.TUI.Notify != "off" {
+		t.Errorf("tui.notify = %q, want off (project wins)", cfg.TUI.Notify)
 	}
 }
 
 func TestLoadPermissionModeOverridesHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	writeConfig(t, home, "[permissions]\nmode = \"acceptEdits\"\n")
+	t.Setenv("KLAUDIA_CONFIG_DIR", "")
+	writeConfig(t, home, "[permissions]\nmode = \"plan\"\n")
 
 	// Global-only → inherited.
-	if cfg := Load(t.TempDir()); cfg.Permissions.Mode != "acceptEdits" {
-		t.Errorf("mode = %q, want acceptEdits (from home)", cfg.Permissions.Mode)
+	if cfg := mustLoad(t, t.TempDir()); cfg.Permissions.Mode != "plan" {
+		t.Errorf("mode = %q, want plan (from home)", cfg.Permissions.Mode)
 	}
 	// Project overrides global.
 	cwd := t.TempDir()
 	writeConfig(t, cwd, "[permissions]\nmode = \"plan\"\n")
-	if cfg := Load(cwd); cfg.Permissions.Mode != "plan" {
+	trust(t, cwd)
+	if cfg := mustLoad(t, cwd); cfg.Permissions.Mode != "plan" {
 		t.Errorf("mode = %q, want plan (project wins)", cfg.Permissions.Mode)
 	}
 }
@@ -80,6 +132,7 @@ func TestLoadPermissionModeOverridesHome(t *testing.T) {
 func TestLoadBrowserProjectOverridesHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "")
 	writeConfig(t, home, `
 [browser]
 engine = "chrome"
@@ -100,8 +153,9 @@ userDataDir = "/project/profile"
 headedFallback = true
 searchEngine = "ddg"
 `)
+	trust(t, cwd)
 
-	cfg := Load(cwd)
+	cfg := mustLoad(t, cwd)
 	if cfg.Browser.Engine != "chrome" {
 		t.Errorf("browser.engine = %q, want inherited chrome", cfg.Browser.Engine)
 	}
@@ -138,61 +192,270 @@ func TestResolveAPIKey(t *testing.T) {
 	}
 }
 
-func TestLoadPermissionsAccumulate(t *testing.T) {
+// [input] enter must survive Load: merge once dropped the whole Input section,
+// so the documented `enter = "newline"` never reached the prompt (#101).
+func TestLoadInputEnterProjectOverridesHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	writeConfig(t, home, `
-[permissions]
-allow = ["Edit"]
-deny = ["Bash(rm:*)"]
-`)
-	cwd := t.TempDir()
-	writeConfig(t, cwd, `
-[permissions]
-allow = ["Bash(go test:*)"]
-`)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
+	writeConfig(t, home, "[input]\nenter = \"newline\"\n")
 
-	cfg := Load(cwd)
-	if len(cfg.Permissions.Allow) != 2 {
-		t.Errorf("allow = %v, want home+project merged", cfg.Permissions.Allow)
+	// Global-only: inherited.
+	if cfg := mustLoad(t, t.TempDir()); cfg.Input.Enter != "newline" {
+		t.Errorf("input.enter = %q, want newline (from home)", cfg.Input.Enter)
 	}
-	if len(cfg.Permissions.Deny) != 1 || cfg.Permissions.Deny[0] != "Bash(rm:*)" {
-		t.Errorf("deny = %v", cfg.Permissions.Deny)
+
+	// Project overrides global.
+	cwd := t.TempDir()
+	writeConfig(t, cwd, "[input]\nenter = \"send\"\n")
+	if cfg := mustLoad(t, cwd); cfg.Input.Enter != "send" {
+		t.Errorf("input.enter = %q, want send (project wins)", cfg.Input.Enter)
+	}
+
+	// A project config without [input] keeps the home value.
+	other := t.TempDir()
+	writeConfig(t, other, "theme = \"nord\"\n")
+	if cfg := mustLoad(t, other); cfg.Input.Enter != "newline" {
+		t.Errorf("input.enter = %q, want newline (inherited past a project config)", cfg.Input.Enter)
 	}
 }
 
-func TestAppendProjectPermission(t *testing.T) {
+func mustLoad(t *testing.T, cwd string) Config {
+	t.Helper()
+	cfg, err := Load(cwd)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	return cfg
+}
+
+func TestLoadSyntaxErrorNamesFileAndLine(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
 	cwd := t.TempDir()
-	if ok, err := AppendProjectPermission(cwd, "allow", "Edit"); err != nil || ok {
-		t.Fatalf("AppendProjectPermission without .klaudia = %v,%v, want false,nil", ok, err)
-	}
+	writeConfig(t, cwd, "model = \"sonnet\"\n[sandbox\nmode = \"os\"\n")
 
-	if err := os.MkdirAll(filepath.Join(cwd, ".klaudia"), 0o755); err != nil {
-		t.Fatal(err)
+	_, err := Load(cwd)
+	if err == nil {
+		t.Fatal("Load accepted a file that does not parse")
 	}
-	if ok, err := AppendProjectPermission(cwd, "allow", "Edit"); err != nil || !ok {
-		t.Fatalf("AppendProjectPermission allow = %v,%v, want true,nil", ok, err)
+	want := ProjectPath(cwd) + ":2:"
+	if !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("error %q, want it to start with %q", err, want)
 	}
-	if ok, err := AppendProjectPermission(cwd, "allow", "Edit"); err != nil || !ok {
-		t.Fatalf("AppendProjectPermission duplicate = %v,%v, want true,nil", ok, err)
-	}
-	if ok, err := AppendProjectPermission(cwd, "deny", "Bash(rm:*)"); err != nil || !ok {
-		t.Fatalf("AppendProjectPermission deny = %v,%v, want true,nil", ok, err)
-	}
+}
 
-	cfg := Load(cwd)
-	if len(cfg.Permissions.Allow) != 1 || cfg.Permissions.Allow[0] != "Edit" {
-		t.Errorf("allow = %v, want [Edit]", cfg.Permissions.Allow)
+func TestLoadHomeParseErrorFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
+	writeConfig(t, home, "model = 5\n")
+
+	_, err := Load(t.TempDir())
+	want := filepath.Join(home, ".klaudia", "config.toml") + ":1:"
+	if err == nil || !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("error %v, want one starting with %q", err, want)
 	}
-	if len(cfg.Permissions.Deny) != 1 || cfg.Permissions.Deny[0] != "Bash(rm:*)" {
-		t.Errorf("deny = %v, want [Bash(rm:*)]", cfg.Permissions.Deny)
+}
+
+func TestLoadUnpositionedErrorNamesFile(t *testing.T) {
+	// go-toml reports a duplicate key without a position; the file must
+	// still be named.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
+	cwd := t.TempDir()
+	writeConfig(t, cwd, "model = \"a\"\nmodel = \"b\"\n")
+
+	_, err := Load(cwd)
+	if err == nil || !strings.HasPrefix(err.Error(), ProjectPath(cwd)+":") {
+		t.Errorf("error %v, want one naming %s", err, ProjectPath(cwd))
+	}
+}
+
+func TestLoadUnknownKeysWarnAndKnownKeysApply(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
+	writeConfig(t, home, "theme = \"nord\"\nfutureSetting = true\n")
+	cwd := t.TempDir()
+	writeConfig(t, cwd, "modle = \"x\"\nmodel = \"sonnet\"\n\n[sandbox]\nmdoe = \"os\"\n")
+
+	cfg := mustLoad(t, cwd)
+	if cfg.Model != "sonnet" || cfg.Theme != "nord" {
+		t.Errorf("model %q theme %q, want the known keys applied", cfg.Model, cfg.Theme)
+	}
+	homePath := filepath.Join(home, ".klaudia", "config.toml")
+	want := []string{
+		homePath + `:2: unknown key "futureSetting", ignored`,
+		ProjectPath(cwd) + `:1: unknown key "modle", ignored`,
+		ProjectPath(cwd) + `:5: unknown key "sandbox.mdoe", ignored`,
+	}
+	if !reflect.DeepEqual(cfg.Warnings, want) {
+		t.Errorf("warnings =\n%q\nwant\n%q", cfg.Warnings, want)
 	}
 }
 
 func TestLoadMissingIsEmpty(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	cfg := Load(t.TempDir())
+	t.Setenv("KLAUDIA_CONFIG_DIR", "")
+	cfg := mustLoad(t, t.TempDir())
 	if cfg.Provider != "" {
 		t.Errorf("expected empty config, got %+v", cfg)
+	}
+}
+
+func TestExtraHeadersEnvMergeOverlaysPerKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "")
+	writeConfig(t, home, `provider = "openai"
+baseURL = "https://x/v1"
+extraHeadersEnv = { "CF-Access-Client-Id" = "CF_ID_HOME", "X-Extra" = "X_HOME" }
+`)
+	cwd := t.TempDir()
+	writeConfig(t, cwd, `extraHeadersEnv = { "CF-Access-Client-Id" = "CF_ID_PROJECT", "CF-Access-Client-Secret" = "CF_SECRET" }
+`)
+	trust(t, cwd)
+
+	cfg := mustLoad(t, cwd)
+	// Project overrides the shared key; home-only key survives; project-only key is added.
+	want := map[string]string{
+		"CF-Access-Client-Id":     "CF_ID_PROJECT",
+		"X-Extra":                 "X_HOME",
+		"CF-Access-Client-Secret": "CF_SECRET",
+	}
+	if !reflect.DeepEqual(cfg.ExtraHeadersEnv, want) {
+		t.Fatalf("merged extraHeadersEnv = %v, want %v", cfg.ExtraHeadersEnv, want)
+	}
+}
+
+func TestResolveExtraHeaders(t *testing.T) {
+	// Absent -> nil, nil.
+	if h, m := (Config{}).ResolveExtraHeaders(); h != nil || m != nil {
+		t.Fatalf("empty config: headers=%v missing=%v, want nil,nil", h, m)
+	}
+	cfg := Config{ExtraHeadersEnv: map[string]string{
+		"CF-Access-Client-Id":     "CF_ID",
+		"CF-Access-Client-Secret": "CF_SECRET",
+	}}
+	t.Setenv("CF_ID", "id-123")
+	os.Unsetenv("CF_SECRET") // referenced but unset -> reported missing (name only)
+
+	headers, missing := cfg.ResolveExtraHeaders()
+	if headers["CF-Access-Client-Id"] != "id-123" {
+		t.Errorf("resolved header = %q, want id-123", headers["CF-Access-Client-Id"])
+	}
+	if _, ok := headers["CF-Access-Client-Secret"]; ok {
+		t.Errorf("unset var must not appear in headers: %v", headers)
+	}
+	if len(missing) != 1 || missing[0] != "CF_SECRET" {
+		t.Errorf("missing = %v, want [CF_SECRET]", missing)
+	}
+}
+
+func TestSessionMaxAge(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		{"", DefaultAutoResumeMaxAge, false},
+		{"0", 0, false},
+		{"12h", 12 * time.Hour, false},
+		{"90m", 90 * time.Minute, false},
+		{"7d", 7 * 24 * time.Hour, false},
+		{"soon", DefaultAutoResumeMaxAge, true},
+		{"-1h", DefaultAutoResumeMaxAge, true},
+		{"xd", DefaultAutoResumeMaxAge, true},
+	} {
+		got, err := Session{AutoResumeMaxAge: tc.in}.MaxAge()
+		if got != tc.want || (err != nil) != tc.wantErr {
+			t.Errorf("MaxAge(%q) = %s, %v; want %s, error %v", tc.in, got, err, tc.want, tc.wantErr)
+		}
+	}
+}
+
+func TestLoadSessionProjectOverridesHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
+	writeConfig(t, home, "[session]\nautoResumeMaxAge = \"12h\"\n")
+	if cfg := mustLoad(t, t.TempDir()); cfg.Session.AutoResumeMaxAge != "12h" {
+		t.Errorf("autoResumeMaxAge = %q, want 12h (from home)", cfg.Session.AutoResumeMaxAge)
+	}
+	cwd := t.TempDir()
+	writeConfig(t, cwd, "[session]\nautoResumeMaxAge = \"0\"\n")
+	if cfg := mustLoad(t, cwd); cfg.Session.AutoResumeMaxAge != "0" {
+		t.Errorf("autoResumeMaxAge = %q, want 0 (project wins)", cfg.Session.AutoResumeMaxAge)
+	}
+}
+
+// Hooks are flat [[hooks]] entries, read with their provenance by LoadHooks
+// and never merged by Load (upstream's shape; the fork's nested per-event
+// tables are gone).
+func TestLoadHooksKeepsProvenance(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
+	writeConfig(t, home, "[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"Bash\"\ncommand = \"echo hi\"\ntimeout = \"30s\"\n")
+	cwd := t.TempDir()
+	writeConfig(t, cwd, "[[hooks]]\nevent = \"PostToolUse\"\ncommand = \"echo proj\"\n")
+
+	src := LoadHooks(cwd)
+	if len(src.User) != 1 || src.User[0].Command != "echo hi" || src.User[0].Matcher != "Bash" || src.User[0].Timeout != "30s" {
+		t.Errorf("user hooks = %+v", src.User)
+	}
+	if len(src.Project) != 1 || src.Project[0].Event != "PostToolUse" {
+		t.Errorf("project hooks = %+v", src.Project)
+	}
+	if cfg := mustLoad(t, cwd); len(cfg.Hooks) != 0 {
+		t.Errorf("Load merged hooks: %+v", cfg.Hooks)
+	}
+}
+
+// The default is on, so the only interesting case is turning it off: with a
+// plain bool, `worktree = false` is indistinguishable from the section being
+// absent and the setting would have no way to work at all.
+func TestSubagentWorktrees(t *testing.T) {
+	tests := []struct {
+		name string
+		home string
+		proj string
+		want bool
+	}{
+		{name: "no config anywhere", want: true},
+		{name: "off in the user's config", home: "[subagents]\nworktree = false\n", want: false},
+		{name: "off in the project", proj: "[subagents]\nworktree = false\n", want: false},
+		{
+			name: "the project turns it back on",
+			home: "[subagents]\nworktree = false\n",
+			proj: "[subagents]\nworktree = true\n",
+			want: true,
+		},
+		{
+			// An unrelated project section must not read as "unset" and lose
+			// the user's choice.
+			name: "a project section that says nothing about it inherits",
+			home: "[subagents]\nworktree = false\n",
+			proj: "model = \"sonnet\"\n",
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("KLAUDIA_CONFIG_DIR", "")
+			if tt.home != "" {
+				writeConfig(t, home, tt.home)
+			}
+			cwd := t.TempDir()
+			if tt.proj != "" {
+				writeConfig(t, cwd, tt.proj)
+			}
+			if got := mustLoad(t, cwd).SubagentWorktrees(); got != tt.want {
+				t.Errorf("SubagentWorktrees = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

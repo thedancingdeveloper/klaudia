@@ -39,6 +39,31 @@ func TestDefaultRegistryLoadsAllTools(t *testing.T) {
 	}
 }
 
+// A run with no interactive frontend (headless -p, --loop, stream-json embedding)
+// must not offer AskUserQuestion: shown the tool, a model reaches for it on any
+// ambiguity and burns a turn learning nobody is there. Everything else stays.
+func TestWithoutFrontendDropsAskUserQuestion(t *testing.T) {
+	reg, err := DefaultRegistry(nil, WithoutFrontend())
+	if err != nil {
+		t.Fatalf("DefaultRegistry: %v", err)
+	}
+	if _, ok := reg.Lookup("AskUserQuestion"); ok {
+		t.Errorf("AskUserQuestion registered without a frontend")
+	}
+	full, err := DefaultRegistry(nil)
+	if err != nil {
+		t.Fatalf("DefaultRegistry: %v", err)
+	}
+	if got, want := len(reg.Names()), len(full.Names())-1; got != want {
+		t.Errorf("registry has %d tools, want %d (all but AskUserQuestion)", got, want)
+	}
+	for _, name := range []string{"Read", "Bash", "ExitPlanMode", "RequestHostChange"} {
+		if _, ok := reg.Lookup(name); !ok {
+			t.Errorf("tool %q missing without a frontend", name)
+		}
+	}
+}
+
 // Names must be stable (sorted) across calls. The tool order drives the request
 // sent every turn; a varying order changes the cached prefix each turn and
 // defeats prompt caching. Regression guard for the map-iteration order bug.
@@ -52,6 +77,46 @@ func TestRegistryNamesAreStableAndSorted(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		if !slices.Equal(reg.Names(), first) {
 			t.Fatalf("Names() order varies between calls: %v vs %v", reg.Names(), first)
+		}
+	}
+}
+
+// The deferred set must name the Browser* and Task* tools (revealed on demand
+// via ToolSearch), every deferred tool must still be registered so it works
+// once revealed, and the common core (edit/read/bash/search + TodoWrite) must
+// stay eager — the whole point is to trim the standing list without losing a
+// capability.
+func TestDefaultDeferredTools(t *testing.T) {
+	deferred := DefaultDeferredTools()
+	want := []string{
+		"BrowserSearch", "BrowserFetch", "BrowserNavigate", "BrowserSnapshot",
+		"TaskCreate", "TaskList", "TaskGet", "TaskUpdate",
+	}
+	if !slices.Equal(append([]string(nil), deferred...), want) {
+		t.Errorf("DefaultDeferredTools() = %v, want %v", deferred, want)
+	}
+
+	reg, err := DefaultRegistry(nil)
+	if err != nil {
+		t.Fatalf("DefaultRegistry: %v", err)
+	}
+	// Every deferred tool is still registered — deferral withholds it from the
+	// request, it does not remove it — so ToolSearch can reveal a working tool.
+	for _, name := range deferred {
+		if _, ok := reg.Lookup(name); !ok {
+			t.Errorf("deferred tool %q is not registered; ToolSearch could not reveal it", name)
+		}
+	}
+
+	// The commonly-used core stays eager: it must never appear in the deferred
+	// set. Paying a ToolSearch round-trip to reach Read or Bash would be a loss.
+	deferredSet := make(map[string]bool, len(deferred))
+	for _, name := range deferred {
+		deferredSet[name] = true
+	}
+	for _, core := range []string{"Read", "Write", "Edit", "Glob", "Grep", "Bash", "BashOutput", "TodoWrite"} {
+		if deferredSet[core] {
+			t.Errorf("core tool %q must stay eager, but it is in the deferred set", core)
 		}
 	}
 }

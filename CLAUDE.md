@@ -7,8 +7,14 @@ CLI agent that helps users with software engineering tasks.
 ```bash
 CGO_ENABLED=0 go install ./cmd/klaudia   # updates the `klaudia` on your PATH
 CGO_ENABLED=0 go build ./...             # compile check only — writes no binary
-go test ./internal/...
+go test ./internal/...                   # unit tests
+go test ./e2e/...                        # the binary against a scripted model
+make check                               # every hermetic layer — what CI runs
 ```
+
+Testing is layered (static, unit, hermetic, e2e, live); `docs/testing.md` says
+what each layer is for and where a new test belongs. Unit tests must not read
+the real `$HOME` — `make hermetic` runs them against a poisoned one.
 
 `go build ./...` with multiple packages compiles and *discards* the results: it
 is a build check, not an install. `go build ./cmd/klaudia` does write a binary,
@@ -22,30 +28,56 @@ Use `go install` when you mean to try the change.
 - **api** - Provider abstraction: Anthropic client + OpenAI-compatible shim
 - **tools** - Local tool implementations
 - **browser** - Lazy headless-Chrome engine + web search
-- **permission** - Permission modes + allow/deny rules (a leaf package)
+- **permission** - The three permission modes (a leaf package)
 - **trust** - Zones, command/tool classification, session-scoped grants
 - **session** - Transcripts, resume, persisted compaction summaries
 - **compaction** - Context/history compression (micro + auto)
-- **mcp** - Model Context Protocol support
-- **subagent** - Built-in sub-agent types
-- **skill** - User-defined skills (`.klaudia/skills`)
+- **mcp** - Model Context Protocol client (2026-07-28) + form elicitation
+- **subagent** - Sub-agent types: built-in, and markdown-defined (`.klaudia/agents`)
+- **worktree** - Per-sub-agent git checkouts: seed, adopt, conflict reporting
+- **skill** - Bundled skills (`skill/bundled/*.md`) + user-defined skills (`.klaudia/skills`)
+- **hooks** - Lifecycle hooks: the four events, project-hook trust, execution
+- **gitguard** - Keeps an autonomous run (the goal loop) from discarding or staging uncommitted work it does not own
 - **memory** - Auto-memory store
 - **doctor** - `/doctor` environment diagnostics
+- **gitprobe** - Klaudia's own read-only git calls, guarded against repo config
 - **streamjson** - Bidirectional stream-json frontend
+- **acp** - Agent Client Protocol v1 agent (editor-driven sessions)
 - **tui** - Terminal UI (Bubble Tea)
 - **prompt** - Prompt construction
 - **cli** - CLI entry point and wiring
 - **native** - Pure-Go search / bash-parsing / PDF
+- **textsafe** - Cleaning text from files and servers before the model sees it
 - **sandbox** - Local / OS-confined / container Bash execution
 - **schema** - Type/schema definitions
 - **version** - Version info
+
+`e2e/` (outside `internal/`) holds the end-to-end tests. `internal/fakeapi` is
+the scripted Anthropic API they and the `internal/cli` tests share — test
+support, imported by nothing in the product.
 
 ## Design record
 
 `docs/ux-spec.md` is the authoritative record of the two terminal-UX specs and
 where the implementation deliberately differs from them — read it before
-"fixing" something that looks unimplemented. `docs/trust.md`, `docs/jobs.md` and
-`docs/working-tree.md` cover the three subsystems in detail.
+"fixing" something that looks unimplemented. `docs/trust.md`, `docs/jobs.md`,
+`docs/working-tree.md`, `docs/hooks.md` and `docs/acp.md` cover five subsystems
+in detail; `docs/embedding.md` is the versioned stream-json contract, and
+`docs/testing.md` covers the test layers.
+
+Hooks are the one subsystem that executes a string from a config file, so
+`docs/hooks.md` is where the reasoning for the trust prompt lives. A hook runs
+*after* the host gate, never instead of it: anything that lets a config file
+grant permission is a bug, not a feature request.
+
+There are three frontends — TUI, stream-json, ACP — and one contract between
+them: `agent.Turn`, applied by `Turn.Apply`. A new capability is a **field on
+`Turn`**, not another parameter on a per-frontend `RunFunc`; the per-frontend
+signatures are what let `AskUserQuestion` and `ExitPlanMode` sit dead over
+stream-json for months, because a frontend that omitted a capability was
+indistinguishable from one that did not want it. `docs/acp.md` records what the
+ACP frontend declines (client-side writes, `terminal/*`, `session/delete`) and
+why those are decisions rather than gaps.
 
 ## Rules
 

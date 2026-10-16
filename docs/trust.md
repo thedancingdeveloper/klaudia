@@ -75,7 +75,13 @@ Some consequences worth being explicit about:
   destroys a disk and asks.
 - **`sudo` is not itself the trigger.** `sudo -u deploy ./scripts/deploy.sh`
   inside the project is project work. Treating every `sudo` as a host change is
-  how a protection gets switched off.
+  how a protection gets switched off. It does decide the cases a command line
+  cannot: `sudo pip install` and `sudo make install` write the system
+  interpreter and prefix, while the same commands unprivileged are usually a
+  virtualenv or a prefix you own, and do not ask.
+- **Refreshing a package index is not installing.** `brew update` and
+  `apt-get update` change nothing that runs; `dnf update` and `brew upgrade`
+  do, and ask.
 
 ## MCP tools
 
@@ -100,7 +106,9 @@ information and conferred no lasting permission, which is how people learn to
 approve without reading.
 
 Plan mode still refuses MCP calls. That is about what the session is for, not
-about who vouches for the call.
+about who vouches for the call. `acceptEdits` asks before every MCP call, the
+hard-to-answer prompt described above: it is the mode for someone who wants to
+see everything but file edits, and that is the price of choosing it.
 
 If you want a server available without granting it a trusting session, mark it
 read-only in `.mcp.json` and reach for it from a read-only sub-agent; that path
@@ -148,13 +156,16 @@ You are asked only when the work genuinely cannot proceed otherwise, and then
 you get three answers rather than two:
 
 ```
-Change this machine? (y)es / (n)o / (s)omething else
+Change this machine? (y)es / (n)o / (s)omething else  (esc cancels turn)
 ```
 
 **Something else** is the one that is easy to leave out and shouldn't be.
 Declining a host change usually means "not like that", not "abandon the task" —
 so it keeps the turn alive and lets you redirect, and what you type lands before
-Klaudia's next action instead of after the turn ends.
+Klaudia's next action instead of after the turn ends. Every other permission
+ask offers it too (`Allow …? (y)es once / (a)lways / (n)o / (s)omething else`),
+for the same reason. Esc is a fourth answer, and a bigger one: it cancels the
+whole turn, so the prompt names it.
 
 The remaining risk is the quiet one: Klaudia hits a gate, decides it cannot
 continue, and simply moves on without telling you. So a host change that was
@@ -188,55 +199,111 @@ tells you what it could not do.
 
 ## Modes
 
-Three, not six:
+Four, not six:
 
 | Mode | Meaning |
 |---|---|
 | `autonomous` | Finish the task; ask before changing this machine. **Default.** |
+| `acceptEdits` | Edit files in the workspace without asking; ask before everything else with an effect. |
 | `plan` | Read-only exploration; mutations blocked. |
 | `bypassPermissions` | No checks at all, including the host gate. |
 
-`autonomous` requires the host guardrail to be enforcing. Without it, autonomous
-is `bypassPermissions` with a friendlier name, so Klaudia refuses the
-combination rather than offering it.
+### `acceptEdits`
 
-The old modes (`default`, `acceptEdits`, `dontAsk`) still work so existing
-configs keep running; they are no longer offered as a choice.
+Claude Code's `acceptEdits`, without its allow rules. It is for a person who
+supervises a session and wants to see every command but not every edit.
+
+| Call | In `acceptEdits` |
+|---|---|
+| `Write`, `Edit`, `NotebookEdit` inside the workspace | runs |
+| the same, outside the workspace | asks |
+| the same, to a file that makes code run later (`.git/`, `.klaudia/`, `.envrc`, …) | asks, as in autonomous |
+| `Bash`, `RestartJob` | asks, every time |
+| `BrowserSearch`, `BrowserFetch`, `BrowserNavigate`, `BrowserSnapshot` | asks |
+| MCP tools | asks |
+| `KNOWLEDGE.md` writes | asks, as in autonomous |
+| reading, searching, LSP, tasks, `Agent`, `Skill`, `KillShell`, `AskUserQuestion` | runs |
+
+The **workspace** is the working directory plus every `--add-dir` / `/add-dir`
+directory, after symlinks are resolved. A link in the project that points out
+of it is outside. A sub-agent's workspace is its own working directory, so a
+writer in its own worktree edits that worktree freely. This is narrower than
+the host gate's project zone, which also counts the rest of `$HOME`, the temp
+directory and tool caches as ordinary work. Those count for autonomous, but in
+`acceptEdits` an edit there asks.
+
+The host gate runs first, exactly as in autonomous. A command that `acceptEdits`
+would ask about but that changes this machine is still stopped or declared by
+the gate. Answering the `acceptEdits` prompt does not get past it, and an
+approved host change does not skip the `acceptEdits` prompt.
+
+There is no "always" answer, as in every mode, so each command asks. A
+headless run (`-p`) has no one to ask and refuses each one with the reason. A
+stream-json or ACP driver receives each as a `can_use_tool` /
+`session/request_permission` ask. The model is told the mode, so it prefers
+edit tools to shell commands for changing files.
+
+Anthropic's server-side `web_search` and `web_fetch` run on the API, not on
+this machine, and cannot be asked about per call. `acceptEdits` keeps them, as
+plan mode does.
+
+Until WI-1272 `acceptEdits` was a deprecated alias for `autonomous`. A launcher
+that still passes it to mean autonomous now gets this stricter mode, which asks
+before commands. Pass `autonomous`, or nothing, for the old behaviour.
+
+`bypassPermissions` is the only way to stop the gate classifying. There is no
+separate "guardrail off" setting, because having one meant a session could sit
+in a state where nothing was checking anything while the mode still read as
+something reassuring.
 
 ## `/trust`
 
 Shows the guardrail's state, the approvals live in this session and what they
-reach, what the classifier has found, and any allow/deny rules carried over from
-the per-command model.
+reach, and what the classifier has found.
 
 ```
 /trust                  show everything
-/trust upgrade          switch from observing to enforcing
-/trust observe          classify and report, change no decisions
-/trust off              disable classification for this session
 /trust revoke <id>      withdraw one approval
 /trust revoke all       withdraw all of them
 ```
 
-## Migration
+There is nothing here to turn the guardrail up or down. It always classifies;
+`/mode bypassPermissions` is the off switch, and it is named after what it does.
 
-A config that already has `[permissions]` allow/deny rules starts in **observe**:
-the classifier runs and `/trust` shows what it found, but nothing is refused and
-your existing per-action prompts continue. You get a one-time notice at startup.
-`/trust upgrade` switches over.
+## What was removed, and why
 
-Everything else starts enforcing.
+The per-command model this replaced is gone rather than deprecated: no
+allow/deny rules, no `--allowedTools`/`--disallowedTools`, no `/allow` and
+`/deny`, no `[permissions] allow` or `[trust]` config, no `default`,
+`acceptEdits` or `dontAsk` modes, and no "always" answer on a prompt.
 
-Existing allow/deny rules keep working, and Klaudia no longer creates new ones —
-approving an operation replaced "allow always". Your rules are listed in
-`/trust`.
+*Fork note (msp-klaudia):* the two retired mode names `default` and `dontAsk`
+are still **accepted** on `--permission-mode`, in `mode =` config and over
+stream-json, as deprecated aliases for `autonomous`, with a one-line notice.
+Launchers built against the old names keep starting rather than exiting 2.
+Rules and `[trust]` are not revived: an alias only picks the mode.
+`acceptEdits` was the third alias until it came back as a real mode (see
+[Modes](#modes)). It is the same name with the meaning it had in Claude Code,
+and without the allow rules that came with it there.
 
-Configure it explicitly with:
+Keeping both models running was worse than either on its own, in a way that
+only showed up in use. The two gates could each permit a call and neither
+described the other, and the coupling between them ran backwards: a rule in
+`.klaudia/config.toml` put the next session into observe, observe dropped its
+permission mode to `default`, and `default` asked before every edit and every
+command. So answering "always" — the thing offered to stop a prompt — was what
+guaranteed more prompts the next time, in a project that would otherwise have
+started autonomous. The persistence was also conditional on `.klaudia/`
+already existing, so a project acquired the behaviour the first time anything
+happened to create that directory.
 
-```toml
-[trust]
-mode = "enforce"   # enforce | observe | off
-```
+Approving an operation replaced "allow always". It is session-scoped, it says
+what it covers, and `/trust` lists it.
+
+If a project still has rules in `.klaudia/config.toml`, delete the
+`[permissions]` allow/deny entries and any `[trust]` section — Klaudia no
+longer reads them. `[permissions] mode` is still read, and now takes
+`autonomous`, `acceptEdits`, `plan` or `bypassPermissions`.
 
 ## Unattended runs
 

@@ -1,6 +1,7 @@
 package trust
 
 import (
+	"path/filepath"
 	"strings"
 
 	"github.com/greenthread-ai/klaudia/internal/native/bashparser"
@@ -215,6 +216,15 @@ func classifyRemote(prog string, args []bashparser.Word, c *cmdCtx, as *Assessme
 	// so the remote side is one script however it was quoted locally.
 	lits, dropped := literals(args)
 	script := strings.Join(lits, " ")
+	// xargs, parallel and find -exec append arguments read at run time, so the
+	// paths a command in the script sees are not the ones written there.
+	feedsArgs := false
+	for _, w := range strings.Fields(script) {
+		switch filepath.Base(strings.Trim(w, `'"();&|`)) {
+		case "xargs", "parallel", "-exec", "-execdir", "-ok", "-okdir":
+			feedsArgs = true
+		}
+	}
 
 	if depth < maxDepth {
 		if inner, err := bashparser.Parse(script); err == nil {
@@ -222,9 +232,15 @@ func classifyRemote(prog string, args []bashparser.Word, c *cmdCtx, as *Assessme
 			before := len(as.Effects)
 			classifyAnalysis(inner, remote, as, depth+1)
 			// Everything the nested pass produced belongs to the remote host.
+			// When a word of the command was dropped as not literal (`"$X"`,
+			// `$(…)`), the script read here is not the one that runs, so
+			// nothing in it counts as spelled out.
 			for i := before; i < len(as.Effects); i++ {
 				as.Effects[i].Zone = remoteZone(as.Effects[i].Zone)
 				as.Effects[i].Target = c.target
+				if dropped || feedsArgs {
+					as.Effects[i].Spelled = false
+				}
 			}
 			if len(as.Effects) > before {
 				return

@@ -38,7 +38,7 @@ func (e *Edit) Name() string { return "Edit" }
 
 func (e *Edit) Description(context.Context) (string, error) {
 	return "Performs an exact string replacement in a file. file_path may be absolute or " +
-		"relative to the working directory. old_string must match exactly (including " +
+		"relative to the working directory. old_string must be non-empty and match exactly (including " +
 		"whitespace) and be unique in the file, unless replace_all is true. new_string " +
 		"must differ from old_string.", nil
 }
@@ -56,6 +56,11 @@ func (e *Edit) ValidateInput(raw json.RawMessage) error {
 	if strings.TrimSpace(in.FilePath) == "" {
 		return fmt.Errorf("file_path is required")
 	}
+	// An empty old_string matches between every rune: replace_all would splice
+	// new_string all through the file, and a single edit fails as "not unique".
+	if in.OldString == "" {
+		return fmt.Errorf("old_string must not be empty; use Write to create a file or replace its whole content")
+	}
 	if in.OldString == in.NewString {
 		return fmt.Errorf("old_string and new_string must differ")
 	}
@@ -66,12 +71,12 @@ func (e *Edit) ValidateInput(raw json.RawMessage) error {
 func (e *Edit) PermissionRequest(raw json.RawMessage) permission.PermissionRequest {
 	var in EditInput
 	_ = json.Unmarshal(raw, &in)
-	return permission.PermissionRequest{Specifier: in.FilePath}
+	return pathRequest(in.FilePath)
 }
 
 // CheckPermissions: Edit is a file-mutating (edit-class) tool.
-func (e *Edit) CheckPermissions(pctx permission.Context, _ permission.PermissionRequest) permission.Decision {
-	return editClassDecision(pctx)
+func (e *Edit) CheckPermissions(pctx permission.Context, req permission.PermissionRequest) permission.Decision {
+	return editPathDecision(pctx, req.Specifier)
 }
 
 func normalizeEditStrings(oldString, newString, content string) (string, string) {
@@ -126,7 +131,7 @@ func editHint(content, oldString string) string {
 	return "Hint: old_string must match exactly, including whitespace. Use Read immediately before Edit and include surrounding unchanged context."
 }
 
-func (e *Edit) Execute(_ context.Context, tctx Context, raw json.RawMessage) ([]Result, error) {
+func (e *Edit) Execute(ctx context.Context, tctx Context, raw json.RawMessage) ([]Result, error) {
 	var in EditInput
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return nil, err
@@ -136,7 +141,7 @@ func (e *Edit) Execute(_ context.Context, tctx Context, raw json.RawMessage) ([]
 	data, err := os.ReadFile(in.FilePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return []Result{{Content: fmt.Sprintf("File does not exist: %s", in.FilePath), IsError: true}}, nil
+			return []Result{{Content: fmt.Sprintf("File does not exist: %s", displayPath(tctx, in.FilePath)), IsError: true}}, nil
 		}
 		return []Result{{Content: fmt.Sprintf("Error reading file: %v", err), IsError: true}}, nil
 	}
@@ -174,13 +179,8 @@ func (e *Edit) Execute(_ context.Context, tctx Context, raw json.RawMessage) ([]
 		updated = strings.Replace(content, oldString, newString, 1)
 	}
 
-	// Preserve the original file mode.
-	info, statErr := os.Stat(in.FilePath)
-	mode := os.FileMode(0o644)
-	if statErr == nil {
-		mode = info.Mode().Perm()
-	}
-	if err := os.WriteFile(in.FilePath, []byte(updated), mode); err != nil {
+	// Atomic, and keeps the original file mode.
+	if err := writeFileAtomic(in.FilePath, []byte(updated), 0o644); err != nil {
 		return []Result{{Content: fmt.Sprintf("Error writing file: %v", err), IsError: true}}, nil
 	}
 
@@ -188,10 +188,13 @@ func (e *Edit) Execute(_ context.Context, tctx Context, raw json.RawMessage) ([]
 	if in.ReplaceAll {
 		n = count
 	}
-	msg := fmt.Sprintf("Edited %s (%d replacement(s))", in.FilePath, n)
+	msg := fmt.Sprintf("Edited %s (%d replacement(s))", displayPath(tctx, in.FilePath), n)
 	if flexible {
 		msg += " — old_string was matched ignoring surrounding whitespace; verify the result with Read if it matters."
 	}
+	// Surface any problems this edit just introduced (no-op when LSP is off or
+	// the language has no server; never errors the edit).
+	msg += appendDiagnostics(ctx, tctx, in.FilePath)
 	return []Result{{Content: msg}}, nil
 }
 

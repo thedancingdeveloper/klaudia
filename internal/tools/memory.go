@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -15,12 +16,12 @@ import (
 
 // MemoryInput is the Memory tool's input.
 type MemoryInput struct {
-	Operation   string `json:"operation" jsonschema:"enum=search,enum=add,enum=view,enum=recent,enum=stale,enum=by_tag,enum=promote,enum=supersede,description=Operation to perform"`
+	Operation   string `json:"operation" jsonschema:"enum=search,enum=add,enum=view,enum=recent,enum=stale,enum=by_tag,enum=promote,enum=supersede,enum=remove,description=Operation to perform"`
 	Scope       string `json:"scope,omitempty" jsonschema:"enum=session,enum=project,description=Where to write for operation=add: session (default) writes .klaudia/MEMORY.md; project writes .klaudia/KNOWLEDGE.md"`
-	Query       string `json:"query,omitempty" jsonschema:"description=Search terms (required for operation=search)"`
+	Query       string `json:"query,omitempty" jsonschema:"description=Search terms (required for operation=search). For operation=remove: terms that pick out the one session note to forget"`
 	Content     string `json:"content,omitempty" jsonschema:"description=The note to store (required for operation=add)"`
 	Tag         string `json:"tag,omitempty" jsonschema:"description=Frontmatter tag to filter on (required for operation=by_tag)"`
-	Name        string `json:"name,omitempty" jsonschema:"description=Detail note name without .md (required for promote/supersede)"`
+	Name        string `json:"name,omitempty" jsonschema:"description=Detail note name without .md (required for promote/supersede; for remove, deletes that detail note)"`
 	Replacement string `json:"replacement,omitempty" jsonschema:"description=The replacing note's name (required for operation=supersede)"`
 	Within      string `json:"within,omitempty" jsonschema:"description=Duration window for operation=recent — accepts Go duration syntax plus 'Nd' for days (e.g. 7d, 24h). Default 7d."`
 	OlderThan   string `json:"older_than,omitempty" jsonschema:"description=Duration threshold for operation=stale. Same format as within. Default 30d."`
@@ -54,8 +55,10 @@ func (m *Memory) Name() string { return "Memory" }
 
 func (m *Memory) Description(context.Context) (string, error) {
 	return "Your persistent memory across sessions. Use it to recall prior context before " +
-		"asking the user or re-investigating, and to store and curate durable facts " +
-		"(decisions, conventions, gotchas) for later.\n\n" +
+		"asking the user or re-investigating, to store and curate durable facts " +
+		"(decisions, conventions, gotchas) for later, and to forget notes that turn out " +
+		"wrong: \"remove\" deletes the one session note matching `query` (include its " +
+		"timestamp to tell apart similar notes), or the detail note `name`.\n\n" +
 		"Recall ops: \"search\" (matches query terms across the MEMORY.md index and the " +
 		".klaudia/memory/*.md detail notes; a detail hit is tagged \"file.md: …\", Read " +
 		"that file for full context), \"view\" (read all session notes), \"recent\" " +
@@ -66,7 +69,8 @@ func (m *Memory) Description(context.Context) (string, error) {
 		"MEMORY.md by default, scope=\"project\" appends to KNOWLEDGE.md), \"promote\" " +
 		"(copy a detail note's body into KNOWLEDGE.md and mark the source superseded — " +
 		"requires `name`), \"supersede\" (record that `name` is replaced by `replacement` " +
-		"— rewrites both files' frontmatter).\n\n" +
+		"— rewrites both files' frontmatter). Writes to KNOWLEDGE.md (scope=\"project\" " +
+		"and \"promote\") ask the user first; session notes do not.\n\n" +
 		"Search early when resuming work. Use `stale` to audit aged context; promote " +
 		"validated lessons to project knowledge.", nil
 }
@@ -114,8 +118,13 @@ func (m *Memory) ValidateInput(raw json.RawMessage) error {
 		if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.Replacement) == "" {
 			return fmt.Errorf("operation \"supersede\" requires name and replacement")
 		}
+	case "remove":
+		hasQuery, hasName := strings.TrimSpace(in.Query) != "", strings.TrimSpace(in.Name) != ""
+		if hasQuery == hasName {
+			return fmt.Errorf("operation \"remove\" requires exactly one of query (a session note) or name (a detail note)")
+		}
 	default:
-		return fmt.Errorf("operation %q is invalid (want search|view|add|recent|stale|by_tag|promote|supersede)", in.Operation)
+		return fmt.Errorf("operation %q is invalid (want search|view|add|recent|stale|by_tag|promote|supersede|remove)", in.Operation)
 	}
 	return nil
 }
@@ -135,14 +144,63 @@ func parseMemoryDuration(s string) (time.Duration, error) {
 	return time.ParseDuration(s)
 }
 
-// PermissionRequest: memory is the agent's own scratch space, not user files.
-func (m *Memory) PermissionRequest(json.RawMessage) permission.PermissionRequest {
+// knowledgeSpecifier is the permission specifier of a Memory call that writes
+// .klaudia/KNOWLEDGE.md: `add` with scope=project, and `promote`. It is what an
+// allow rule names to pre-approve those writes — "Memory(project)" — and what
+// the TUI remembers when the user answers "always".
+const knowledgeSpecifier = "project"
+
+// writesKnowledge reports whether raw is a Memory call that writes KNOWLEDGE.md.
+// Parsed leniently: the permission check runs before ValidateInput, and input
+// that does not parse is refused there, before anything is written.
+func writesKnowledge(raw json.RawMessage) bool {
+	var in MemoryInput
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return false
+	}
+	return in.Operation == "promote" || (in.Operation == "add" && in.Scope == "project")
+}
+
+// PermissionRequest: session notes (MEMORY.md, the detail notes) are the
+// agent's own scratch space and carry no specifier. A write to KNOWLEDGE.md is
+// the one Memory action that is gated, and it carries knowledgeSpecifier so an
+// allow rule can name it without allowing it for every other Memory call.
+func (m *Memory) PermissionRequest(raw json.RawMessage) permission.PermissionRequest {
+	if writesKnowledge(raw) {
+		return permission.PermissionRequest{Specifier: knowledgeSpecifier}
+	}
 	return permission.PermissionRequest{}
 }
 
-func (m *Memory) CheckPermissions(pctx permission.Context, _ permission.PermissionRequest) permission.Decision {
-	return allowAlways(pctx)
+// CheckPermissions allows every Memory operation except a write to
+// KNOWLEDGE.md, which asks in every mode that can ask — autonomous included.
+//
+// KNOWLEDGE.md is loaded into the system prompt of every later session. Were
+// the model free to write it, text it read on a web page or from an MCP server
+// could plant itself there and outlive the session it arrived in; a person
+// saying yes is what makes an entry curated. Session notes stay autonomous:
+// they are recalled as the model's own notes, not as project knowledge.
+// bypassPermissions and an allow rule ("Memory(project)") are handled upstream
+// by permission.Check.
+func (m *Memory) CheckPermissions(pctx permission.Context, req permission.PermissionRequest) permission.Decision {
+	if req.Specifier != knowledgeSpecifier {
+		return allowAlways(pctx)
+	}
+	switch permission.CurrentMode(pctx) {
+	case permission.ModePlan:
+		return permission.Decision{Behavior: permission.Deny, Message: "plan mode is read-only; writing project knowledge (.klaudia/KNOWLEDGE.md) is not allowed"}
+	default:
+		return permission.Decision{Behavior: permission.Ask, Message: knowledgeUnapprovedMsg}
+	}
 }
+
+// knowledgeUnapprovedMsg explains a KNOWLEDGE.md write that needs the user. It
+// is the ask's fallback detail and, when no one can answer (headless, dontAsk),
+// the refusal the model reads — so it says what to do instead.
+const knowledgeUnapprovedMsg = "Writing project knowledge (.klaudia/KNOWLEDGE.md) needs the user's approval, " +
+	"because it is loaded into every future session, and no one approved this write. " +
+	"Keep the note in session memory instead (operation=add without scope=project), " +
+	"or tell the user what you would add."
 
 func (m *Memory) Execute(_ context.Context, _ Context, raw json.RawMessage) ([]Result, error) {
 	var in MemoryInput
@@ -209,6 +267,8 @@ func (m *Memory) Execute(_ context.Context, _ Context, raw json.RawMessage) ([]R
 			return []Result{{Content: "Supersede failed: " + err.Error(), IsError: true}}, nil
 		}
 		return []Result{{Content: "Marked " + in.Name + " as superseded by " + in.Replacement + "."}}, nil
+	case "remove":
+		return m.remove(in), nil
 	default: // view
 		idx, err := m.store.Index()
 		if err != nil {
@@ -219,6 +279,32 @@ func (m *Memory) Execute(_ context.Context, _ Context, raw json.RawMessage) ([]R
 		}
 		return []Result{{Content: idx}}, nil
 	}
+}
+
+// remove runs operation=remove: a detail note by name, else the one session
+// note query matches. The result names what was removed, or, when the query is
+// ambiguous, lists the candidates so the next call can pick one.
+func (m *Memory) remove(in MemoryInput) []Result {
+	if name := strings.TrimSpace(in.Name); name != "" {
+		if err := m.store.RemoveNote(name); err != nil {
+			if errors.Is(err, memory.ErrNotFound) {
+				return []Result{{Content: "Remove failed: no detail note .klaudia/memory/" + strings.TrimSuffix(name, ".md") + ".md", IsError: true}}
+			}
+			return []Result{{Content: "Remove failed: " + err.Error(), IsError: true}}
+		}
+		return []Result{{Content: "Removed detail note " + strings.TrimSuffix(name, ".md") + " and its index pointer."}}
+	}
+	matched, err := m.store.Remove(in.Query)
+	switch {
+	case errors.Is(err, memory.ErrAmbiguous):
+		return []Result{{Content: fmt.Sprintf("Nothing removed: %d session notes match %q. Narrow the query (the timestamp picks out one):\n- %s",
+			len(matched), in.Query, strings.Join(matched, "\n- ")), IsError: true}}
+	case errors.Is(err, memory.ErrNotFound):
+		return []Result{{Content: fmt.Sprintf("Nothing removed: no session note matches %q. A detail note under .klaudia/memory/ is removed with name.", in.Query), IsError: true}}
+	case err != nil:
+		return []Result{{Content: "Remove failed: " + err.Error(), IsError: true}}
+	}
+	return []Result{{Content: "Removed from session memory: " + matched[0]}}
 }
 
 // formatEntries renders the Recent/Stale/ByTag list as a bullet list with

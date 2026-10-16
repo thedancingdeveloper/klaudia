@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"encoding/json"
 	"runtime"
 	"strings"
 	"testing"
@@ -29,6 +30,16 @@ func TestRunAuthAndConfig(t *testing.T) {
 	}
 	if c, _ := find(checks, "mcp"); c.Status != StatusOK || !strings.Contains(c.Detail, "2") {
 		t.Errorf("mcp = %+v", c)
+	}
+}
+
+func TestRunReportsBuild(t *testing.T) {
+	c, ok := find(Run(Input{Build: "abcdef123456+dirty (go1.26.8)"}), "version")
+	if !ok || c.Status != StatusInfo || !strings.Contains(c.Detail, "2.1.66-klaudia") || !strings.Contains(c.Detail, "abcdef123456+dirty") {
+		t.Errorf("version = %+v", c)
+	}
+	if c, _ := find(Run(Input{}), "version"); !strings.Contains(c.Detail, "build unknown") {
+		t.Errorf("version without a build = %+v", c)
 	}
 }
 
@@ -146,6 +157,63 @@ func TestFormatTokens(t *testing.T) {
 	}
 }
 
+func TestCriticalOnlyForMissingCredential(t *testing.T) {
+	// No credential → critical (klaudia can't reach a model at all).
+	if !Critical(Run(Input{AuthOK: false})) {
+		t.Error("missing credential should be critical")
+	}
+	// A credential resolves → not critical, even with other warnings present
+	// (e.g. an OS-sandbox binary missing on this platform, or no LSPs).
+	checks := Run(Input{AuthOK: true, AuthKind: "api-key", SandboxMode: "os"})
+	if Critical(checks) {
+		t.Errorf("a resolved credential should not be critical: %+v", checks)
+	}
+}
+
+func TestNewReportOKMirrorsCritical(t *testing.T) {
+	if r := NewReport(Run(Input{AuthOK: false})); r.OK {
+		t.Error("report OK should be false when a critical check failed")
+	}
+	if r := NewReport(Run(Input{AuthOK: true, AuthKind: "oauth"})); !r.OK {
+		t.Error("report OK should be true when no critical check failed")
+	}
+}
+
+func TestReportJSONMarshaling(t *testing.T) {
+	report := NewReport([]Check{
+		{Name: "auth", Status: StatusOK, Detail: "credential resolved (oauth)"},
+		{Name: "lsp", Status: StatusWarn, Detail: "install gopls"},
+	})
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// Round-trip and check the lowercased json keys are present and stable.
+	var got struct {
+		Checks []map[string]string `json:"checks"`
+		OK     bool                `json:"ok"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.OK {
+		t.Errorf("ok = false, want true; json: %s", data)
+	}
+	if len(got.Checks) != 2 {
+		t.Fatalf("checks = %d, want 2; json: %s", len(got.Checks), data)
+	}
+	first := got.Checks[0]
+	if first["name"] != "auth" || first["status"] != StatusOK || !strings.Contains(first["detail"], "oauth") {
+		t.Errorf("first check = %v", first)
+	}
+	// Field names must be the lowercased json tags, not the Go field names.
+	for _, k := range []string{"name", "status", "detail"} {
+		if _, ok := first[k]; !ok {
+			t.Errorf("json check missing key %q: %s", k, data)
+		}
+	}
+}
+
 // exerrNotFound is a sentinel "binary not found" error for the lookPath stub.
 var exerrNotFound = &exErr{}
 
@@ -179,5 +247,137 @@ func TestSkillsCheckDistinguishesEmptyFromBroken(t *testing.T) {
 		if !strings.Contains(got.Detail, want) {
 			t.Errorf("loaded: detail %q missing %q", got.Detail, want)
 		}
+	}
+	if strings.Contains(got.Detail, "none of your own") {
+		t.Errorf("loaded: detail %q claims there are no user skills", got.Detail)
+	}
+
+	// Only the bundled skills: something loaded, but the user's directories
+	// came up empty — the case the directory hint exists for.
+	got, _ = find(Run(Input{Skills: []Skill{{Name: "code-review", Scope: "bundled"}}}), "skills")
+	for _, want := range []string{"code-review (bundled)", "none of your own", ".klaudia/skills"} {
+		if !strings.Contains(got.Detail, want) {
+			t.Errorf("bundled only: detail %q missing %q", got.Detail, want)
+		}
+	}
+}
+
+func TestHooksCheck(t *testing.T) {
+	// A hook is a shell command attached to the model's work, and the two
+	// states that need distinguishing are "none configured" and "configured but
+	// waiting on an approval it will never get" — both look like silence.
+	tests := []struct {
+		name   string
+		hooks  []Hook
+		status string
+		want   []string
+	}{
+		{
+			name:   "none configured says where to put one",
+			status: StatusInfo,
+			want:   []string{"none configured", "[[hooks]]", "config.toml"},
+		},
+		{
+			name: "user hooks are listed with their matchers",
+			hooks: []Hook{
+				{Event: "SessionStart", Scope: "user"},
+				{Event: "PreToolUse", Matcher: "Bash", Scope: "user"},
+			},
+			status: StatusOK,
+			want:   []string{"2 user", "SessionStart", "PreToolUse(Bash)"},
+		},
+		{
+			name: "scopes are counted separately",
+			hooks: []Hook{
+				{Event: "PostToolUse", Scope: "user"},
+				{Event: "PreToolUse", Scope: "project"},
+			},
+			status: StatusOK,
+			want:   []string{"1 user", "1 project"},
+		},
+		{
+			name: "an unapproved project hook warns that it will not run",
+			hooks: []Hook{
+				{Event: "PreToolUse", Scope: "project", Dormant: true},
+			},
+			status: StatusWarn,
+			want:   []string{"1 project", "will not run"},
+		},
+		{
+			name: "declaration order is preserved",
+			hooks: []Hook{
+				{Event: "PostToolUse", Matcher: "Write", Scope: "user"},
+				{Event: "PostToolUse", Matcher: "Edit", Scope: "user"},
+			},
+			status: StatusOK,
+			want:   []string{"PostToolUse(Write), PostToolUse(Edit)"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := find(Run(Input{Hooks: tt.hooks}), "hooks")
+			if !ok {
+				t.Fatal("no hooks check in report")
+			}
+			if got.Status != tt.status {
+				t.Errorf("status = %q, want %q (detail %q)", got.Status, tt.status, got.Detail)
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(got.Detail, want) {
+					t.Errorf("detail %q missing %q", got.Detail, want)
+				}
+			}
+		})
+	}
+}
+
+func TestMCPTransportCheck(t *testing.T) {
+	// The legacy HTTP+SSE transport still works. The point of the check is that
+	// when a server drops it, the only symptom is a connect error that says
+	// nothing about the one word in .mcp.json that fixes it.
+	tests := []struct {
+		name   string
+		in     Input
+		absent bool
+		want   []string
+	}{
+		{
+			name:   "no sse servers raises nothing",
+			in:     Input{MCPServers: 2},
+			absent: true,
+		},
+		{
+			name: "an sse server is named with the fix",
+			in:   Input{MCPServers: 1, MCPLegacySSE: []string{"legacy"}},
+			want: []string{"legacy", "deprecated", "sse", "streamable"},
+		},
+		{
+			name: "several are listed together",
+			in:   Input{MCPServers: 3, MCPLegacySSE: []string{"alpha", "beta"}},
+			want: []string{"alpha, beta"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := find(Run(tt.in), "mcp:transport")
+			if tt.absent {
+				if ok {
+					t.Fatalf("unexpected mcp:transport check: %q", got.Detail)
+				}
+				return
+			}
+			if !ok {
+				t.Fatal("no mcp:transport check in report")
+			}
+			if got.Status != StatusWarn {
+				t.Errorf("status = %q, want %q", got.Status, StatusWarn)
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(got.Detail, want) {
+					t.Errorf("detail %q missing %q", got.Detail, want)
+				}
+			}
+		})
 	}
 }

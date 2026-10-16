@@ -13,9 +13,10 @@ import (
 // regOptions holds the caller-owned, session-scoped resources the registry's
 // tools share. The caller is responsible for their lifecycle (Close/KillAll).
 type regOptions struct {
-	browser *browser.Engine
-	shells  *JobStore
-	lsp     *lsp.Pool
+	browser    *browser.Engine
+	shells     *JobStore
+	lsp        *lsp.Pool
+	noFrontend bool
 }
 
 // RegOption configures DefaultRegistry.
@@ -30,9 +31,18 @@ func WithBrowserEngine(e *browser.Engine) RegOption { return func(o *regOptions)
 func WithJobStore(s *JobStore) RegOption { return func(o *regOptions) { o.shells = s } }
 
 // WithLSP supplies the language-server pool backing Diagnostics/Definition/
-// References. The caller Close()s it at session end. When omitted, the LSP tools
-// are not registered.
+// References/WorkspaceSymbol. The caller Close()s it at session end. When
+// omitted, the LSP tools are not registered.
 func WithLSP(p *lsp.Pool) RegOption { return func(o *regOptions) { o.lsp = p } }
+
+// WithoutFrontend declares that no interactive frontend exists for this run
+// (headless -p, --loop, stream-json embedding). Tools whose only purpose is to
+// put a question to a human — AskUserQuestion — are then not registered at
+// all, instead of being offered to the model and answering "no interactive
+// user is available" when called. A model that is shown the tool will reach
+// for it on any ambiguity, burning a turn (often several) to learn there is
+// nobody there; a model that is not shown it picks a default and states it.
+func WithoutFrontend() RegOption { return func(o *regOptions) { o.noFrontend = true } }
 
 // DefaultRegistry builds the registry of all implemented local tools, with the
 // Bash tool wired to the given executor (local host, or a container sandbox).
@@ -85,13 +95,16 @@ func DefaultRegistry(executor sandbox.Executor, opts ...RegOption) (*Registry, e
 		{"TaskGet", func() (Tool, error) { return NewTaskGet(taskStore) }},
 		{"TaskUpdate", func() (Tool, error) { return NewTaskUpdate(taskStore) }},
 		{"NotebookEdit", func() (Tool, error) { return NewNotebookEdit() }},
-		{"AskUserQuestion", func() (Tool, error) { return NewAskUserQuestion() }},
 		{"ExitPlanMode", func() (Tool, error) { return NewExitPlanMode() }},
 		{"RequestHostChange", func() (Tool, error) { return NewRequestHostChange() }},
 		{"BrowserSearch", func() (Tool, error) { return NewBrowserSearch(engine) }},
 		{"BrowserFetch", func() (Tool, error) { return NewBrowserFetch(engine) }},
 		{"BrowserNavigate", func() (Tool, error) { return NewBrowserNavigate(engine) }},
 		{"BrowserSnapshot", func() (Tool, error) { return NewBrowserSnapshot(engine) }},
+	}
+	// AskUserQuestion needs a human on the other end; see WithoutFrontend.
+	if !cfg.noFrontend {
+		ctors = append(ctors, ctor{"AskUserQuestion", func() (Tool, error) { return NewAskUserQuestion() }})
 	}
 	// LSP code-intel tools are registered only when a language-server pool is
 	// supplied (i.e. the interactive/headless CLI, not bare tests).
@@ -101,6 +114,11 @@ func DefaultRegistry(executor sandbox.Executor, opts ...RegOption) (*Registry, e
 			ctor{"Diagnostics", func() (Tool, error) { return NewDiagnostics(pool) }},
 			ctor{"Definition", func() (Tool, error) { return NewDefinition(pool) }},
 			ctor{"References", func() (Tool, error) { return NewReferences(pool) }},
+			ctor{"WorkspaceSymbol", func() (Tool, error) { return NewWorkspaceSymbol(pool) }},
+			ctor{"Implementation", func() (Tool, error) { return NewImplementation(pool) }},
+			ctor{"Hover", func() (Tool, error) { return NewHover(pool) }},
+			ctor{"DocumentSymbols", func() (Tool, error) { return NewDocumentSymbols(pool) }},
+			ctor{"Rename", func() (Tool, error) { return NewRename(pool) }},
 		)
 	}
 
@@ -113,4 +131,32 @@ func DefaultRegistry(executor sandbox.Executor, opts ...RegOption) (*Registry, e
 		ts = append(ts, t)
 	}
 	return NewRegistry(ts...), nil
+}
+
+// DefaultDeferredTools names the local tools withheld from the initial request
+// and revealed on demand by ToolSearch, alongside the MCP tools the caller
+// already defers. They stay registered — so they work the moment ToolSearch
+// reveals them — but they are kept out of every request's standing tool list,
+// where each one costs input tokens (and, because the list is part of the
+// cached prompt prefix, cache) on turns that never touch it.
+//
+// The set is deliberately narrow: the common edit/read/bash/search core
+// (Read, Write, Edit, Glob, Grep, Bash and the job tools) and the TodoWrite
+// planning checklist stay eager, because almost every non-trivial turn uses
+// them and paying to search for them would be a net loss.
+//
+//   - Browser* (BrowserSearch/BrowserFetch/BrowserNavigate/BrowserSnapshot):
+//     the headless-Chrome web tools. Their own descriptions already tell the
+//     model to prefer the server-side web_search/web_fetch on Claude models;
+//     these are the fallback for non-Claude models or an explicit "use the
+//     browser", so they do not belong in every request.
+//   - Task* (TaskCreate/TaskList/TaskGet/TaskUpdate): the four-tool session
+//     task store. This is distinct from TodoWrite (which stays eager): it is a
+//     heavier, persistent-within-session task surface most turns never touch,
+//     and four standing tools is a lot to carry for it.
+func DefaultDeferredTools() []string {
+	return []string{
+		"BrowserSearch", "BrowserFetch", "BrowserNavigate", "BrowserSnapshot",
+		"TaskCreate", "TaskList", "TaskGet", "TaskUpdate",
+	}
 }

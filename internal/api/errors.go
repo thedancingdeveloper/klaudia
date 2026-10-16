@@ -20,7 +20,33 @@ func FriendlyError(err error) string {
 		return ""
 	}
 	if status, ok := apiStatus(err); ok {
+		// Before the status switch: an unknown model arrives as a 404 from
+		// most hosts and as a 400 carrying the model_not_found code from
+		// some, and either way the raw body ("openai endpoint 404:
+		// {…model_not_found…}") says nothing about how to recover. Other 400s
+		// that merely mention a model ("invalid model parameter") keep the
+		// Bad request message below, which already quotes the provider: they
+		// can be a malformed value rather than an unknown one, and "not
+		// found" would be a guess.
+		if IsModelNotFound(err) && (status == 404 || hasModelNotFoundCode(err)) {
+			return modelNotFoundMessage(err)
+		}
 		switch status {
+		case 404:
+			// A 404 that does not mention a model is the endpoint not serving
+			// the path at all — almost always a baseURL missing or doubling
+			// its /v1 suffix.
+			out := "Not found (404)"
+			if _, endpoint := requestContext(err); endpoint != "" {
+				out += " at " + endpoint
+			}
+			if detail := notFoundDetail(err); detail != "" {
+				out += ": " + detail + "."
+			} else {
+				out += "."
+			}
+			return out + " Check the baseURL in ~/.klaudia/config.toml or ./.klaudia/config.toml " +
+				"(OpenAI-compatible endpoints usually end in /v1)."
 		case 429:
 			// OpenAI: 429 is BOTH transient throttling and "insufficient_quota"
 			// (billing). They need very different advice and the provider's own
@@ -89,9 +115,15 @@ func FriendlyError(err error) string {
 					return "Conversation outgrew the model's context window — the provider returned: " + detail +
 						" Set `contextWindow` in .klaudia/config.toml to match this model so autocompaction triggers earlier, and run /compact to summarise the current session."
 				}
-				return fmt.Sprintf("Bad request (400): %s", detail)
+				return withHint(fmt.Sprintf("Bad request (400): %s", detail), modelIDHint(err))
 			}
-			return "Bad request (400) — the model rejected the request shape; check the input."
+			// No envelope we can read: quote what the provider sent rather
+			// than guess. The guess ("rejected the request shape") sent a user
+			// chasing the request when the model id was wrong (#245).
+			if body := rawBody(err); body != "" {
+				return withHint("Bad request (400): the provider returned: "+body, modelIDHint(err))
+			}
+			return "Bad request (400) — the model rejected the request shape; check the input." + modelIDHint(err)
 		case 401, 403:
 			// OpenAI-compatible providers send specific messages here ("Incorrect
 			// API key provided", "You don't have access to …"); surface them and
@@ -127,6 +159,16 @@ func FriendlyError(err error) string {
 	// The stall wraps DeadlineExceeded, so check it first: the connection went
 	// idle mid-stream (flaky network/proxy/VPN), which is unrelated to the
 	// baseURL the generic timeout branch below points at.
+	if errors.Is(err, ErrStreamInterrupted) {
+		if errors.Is(err, errStallMidStream) {
+			return "The model's reply was cut off partway (the stream ended or the service reported an " +
+				"error before the response finished), so the partial answer above is incomplete. It was " +
+				"not retried automatically — that would repeat what you already saw. Send your message " +
+				"again.\nDetails: " + err.Error()
+		}
+		return "The model's reply was interrupted before it began and retries did not succeed. Send your " +
+			"message again.\nDetails: " + err.Error()
+	}
 	if errors.Is(err, ErrStreamStalled) {
 		// Two shapes, and saying "auto-retried" for both was a lie: a stall
 		// after output has been delivered is never retried, because a fresh
@@ -306,4 +348,190 @@ func IsContextOverflow(err error) bool {
 		return true
 	}
 	return isContextOverflow(err.Error())
+}
+
+// IsTransient reports whether err is a failure that the same request may
+// succeed on later: a rate limit (429), a server error or overload (5xx, 529,
+// or an overloaded/api error event mid-stream), a stalled stream, or a network
+// error. A cancelled context, a request the API rejected (400, 401, 403, 404,
+// 413) and a context overflow are not: repeating them fails the same way.
+func IsTransient(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, ErrStreamStalled) {
+		return true
+	}
+	// Status first: a context overflow is a 400, so it is already not
+	// transient here, and the text check below needs no API error's Error().
+	if status, ok := apiStatus(err); ok {
+		if status == 429 || status >= 500 {
+			return true
+		}
+		if status == 200 { // an error event after the response began
+			t, _ := anthropicPayload(err)
+			return t == "overloaded_error" || t == "api_error"
+		}
+		return false
+	}
+	if IsContextOverflow(err) {
+		return false
+	}
+	var netErr net.Error
+	var opErr *net.OpError
+	return errors.As(err, &netErr) || errors.As(err, &opErr)
+}
+
+// hasModelNotFoundCode reports whether an OpenAI-compatible error carries the
+// explicit model_not_found code, the one unambiguous signal a 400 can give.
+func hasModelNotFoundCode(err error) bool {
+	oai := openAIPayload(err)
+	return oai != nil && codeIs(oai.Code, "model_not_found")
+}
+
+// notFoundDetail is providerDetail, falling back to an OpenAI-compatible
+// host's plain-text body ("model not found", "404 page not found") when there
+// is no JSON envelope to read a message from.
+func notFoundDetail(err error) string {
+	if d := providerDetail(err); d != "" {
+		return d
+	}
+	var oai *OpenAIError
+	if errors.As(err, &oai) {
+		return strings.TrimSpace(oai.Body)
+	}
+	return ""
+}
+
+// modelNotFoundMessage names the model and the endpoint that refused it and
+// the two ways to choose another: /model in the TUI, --model on the command
+// line. The provider's own wording is kept at the end, since some hosts add
+// something useful ("…or you do not have access to it").
+func modelNotFoundMessage(err error) string {
+	model, endpoint := requestContext(err)
+	if model == "" {
+		model = anthropicNotFoundModel(err)
+	}
+	out := "Model not found: "
+	if model != "" {
+		out += model + " isn't served by "
+	} else {
+		out += "the model isn't served by "
+	}
+	if endpoint != "" {
+		out += endpoint
+	} else {
+		out += "this endpoint"
+	}
+	out += ". Run /model to pick from the models it lists, or pass --model <id> (or set `model` in .klaudia/config.toml)."
+	if detail := notFoundDetail(err); detail != "" {
+		out += " The provider said: " + detail
+	}
+	return out + modelIDHint(err)
+}
+
+// withHint appends hint to msg, closing msg's sentence first when it does not
+// end in punctuation (provider messages often don't).
+func withHint(msg, hint string) string {
+	if hint == "" {
+		return msg
+	}
+	if !strings.HasSuffix(msg, ".") && !strings.HasSuffix(msg, "!") && !strings.HasSuffix(msg, "?") && !strings.HasSuffix(msg, "…") {
+		msg += "."
+	}
+	return msg + hint
+}
+
+// maxBodyQuote caps how much of a raw response body an error message quotes.
+const maxBodyQuote = 400
+
+// rawBody is an OpenAI-compatible error's response body on one line, cut to
+// maxBodyQuote runes, or "" when there is none.
+func rawBody(err error) string {
+	var oai *OpenAIError
+	if !errors.As(err, &oai) {
+		return ""
+	}
+	b := strings.Join(strings.Fields(oai.Body), " ")
+	if r := []rune(b); len(r) > maxBodyQuote {
+		b = string(r[:maxBodyQuote]) + "…"
+	}
+	return b
+}
+
+// modelIDHint explains the provider-prefix trap when an OpenAI-compatible
+// endpoint rejected a model id of the form "<prefix>/<name>": the id is sent
+// exactly as written, and "openai/grok-4.7" is not "grok-4.7" (#245). Ids are
+// not rewritten automatically because some hosts (OpenRouter) really do name
+// models "openai/gpt-5". When the endpoint listed what it serves and the bare
+// name is on that list, the hint says so outright. "" when it does not apply.
+func modelIDHint(err error) string {
+	var oai *OpenAIError
+	if !errors.As(err, &oai) {
+		return ""
+	}
+	model, _ := requestContext(err)
+	i := strings.LastIndex(model, "/")
+	if i <= 0 || i == len(model)-1 {
+		return ""
+	}
+	bare := model[i+1:]
+	for _, m := range oai.SupportedModels() {
+		if m == bare {
+			return fmt.Sprintf(" The endpoint serves %q: model ids are sent exactly as written, so set model = %q (drop the %q prefix).",
+				bare, bare, model[:i+1])
+		}
+	}
+	return fmt.Sprintf(" Note: model ids are sent to the endpoint exactly as written, prefix included — if it lists %q "+
+		"rather than %q (see /model, or GET <baseURL>/models), set model = %q.", bare, model, bare)
+}
+
+// anthropicNotFoundModel reads the model id out of Anthropic's 404 body,
+// whose message is exactly "model: <id>". Used only when the error was not
+// annotated with the request's model.
+func anthropicNotFoundModel(err error) string {
+	_, msg := anthropicPayload(err)
+	if id, ok := strings.CutPrefix(strings.TrimSpace(msg), "model:"); ok {
+		return strings.TrimSpace(id)
+	}
+	return ""
+}
+
+// requestError annotates a provider error with the model and endpoint the
+// request went to. Neither the Anthropic SDK's error nor OpenAIError carries
+// the model, and a "model not found" that does not say which model, or where,
+// leaves the user guessing whether the typo is in the id or the baseURL.
+// Error() is the inner error's text unchanged, and Unwrap keeps every
+// errors.As classification working through it.
+type requestError struct {
+	model    string
+	endpoint string
+	err      error
+}
+
+func (e *requestError) Error() string { return e.err.Error() }
+func (e *requestError) Unwrap() error { return e.err }
+
+// annotateNotFound wraps err with the request's model and endpoint when it is
+// a 4xx — a 404, a model-not-found, or a 400 whose message may need to explain
+// the model id (modelIDHint). Every other error is returned unchanged.
+func annotateNotFound(err error, model, endpoint string) error {
+	if err == nil {
+		return nil
+	}
+	status, ok := apiStatus(err)
+	if !ok || status < 400 || status >= 500 {
+		return err
+	}
+	return &requestError{model: model, endpoint: endpoint, err: err}
+}
+
+// requestContext returns the model and endpoint annotateNotFound attached to
+// err, or empty strings when it was not annotated.
+func requestContext(err error) (model, endpoint string) {
+	var re *requestError
+	if errors.As(err, &re) {
+		return re.model, re.endpoint
+	}
+	return "", ""
 }

@@ -36,26 +36,15 @@ func (m *Model) fetchModels() tea.Cmd {
 	}
 }
 
-// showModelPicker turns the fetched list into the standard numbered picker.
+// showModelPicker turns the fetched list into the standard picker.
 func (m *Model) showModelPicker(models []api.ModelInfo) {
 	if len(models) == 0 {
 		m.appendLine(bannerStyle.Render("The provider reported no models. /model <id> still works."))
 		return
 	}
-	// The picker is digit-selected, so it can only offer nine. The list arrives
-	// newest-first from Anthropic and sorted from OpenAI-compatible endpoints,
-	// so the truncation keeps the most useful end either way — and says so
-	// rather than silently hiding the rest.
-	shown := models
-	truncated := 0
-	if len(shown) > 9 {
-		truncated = len(shown) - 9
-		shown = shown[:9]
-	}
-
-	current := api.ResolveModel(m.sess.Model)
-	items := make([]choiceItem, 0, len(shown))
-	for _, mi := range shown {
+	current := api.ResolveModelFor(m.sess.Provider, m.sess.Model)
+	items := make([]choiceItem, 0, len(models))
+	for _, mi := range models {
 		mi := mi
 		label := mi.Name()
 		if mi.Name() != mi.ID {
@@ -73,11 +62,9 @@ func (m *Model) showModelPicker(models []api.ModelInfo) {
 		})
 	}
 
-	title := "Select a model:"
-	if truncated > 0 {
-		title += fmt.Sprintf("  (%d more — /model <id> to pick one not listed)", truncated)
-	}
-	m.startChoice(title, items)
+	// Every model is offered: the picker scrolls and filters (picker.go), so an
+	// endpoint serving dozens of models no longer loses all but nine of them.
+	m.startChoice("Select a model:", items)
 }
 
 // setModel switches the model for subsequent turns. A context window from the
@@ -87,7 +74,9 @@ func (m *Model) showModelPicker(models []api.ModelInfo) {
 func (m *Model) setModel(id string, contextWindow int) string {
 	id = strings.TrimSpace(id)
 	m.sess.Model = id
-	m.sess.ResolvedModel = string(api.ResolveModel(id))
+	// Aliases resolve only on Anthropic; another provider is sent the id as
+	// typed, so a bare "sonnet" there gets a warning instead of a rewrite.
+	m.sess.ResolvedModel = string(api.ResolveModelFor(m.sess.Provider, id))
 
 	msg := "Model set to " + id
 	if resolved := m.sess.ResolvedModel; resolved != id {
@@ -96,11 +85,35 @@ func (m *Model) setModel(id string, contextWindow int) string {
 	if contextWindow > 0 {
 		m.sess.ContextWindow = contextWindow
 		m.sess.ContextWindowSource = "provider"
-	} else if limit, source := api.ContextWindow(id, 0); limit > 0 {
+	} else if limit, source := api.ContextWindowFor(m.sess.Provider, id, 0); limit > 0 {
 		m.sess.ContextWindow, m.sess.ContextWindowSource = limit, source
 	}
 	if m.sess.ContextWindow > 0 {
 		msg += fmt.Sprintf(" · %s context", humanTokens(int64(m.sess.ContextWindow)))
 	}
-	return msg + ". Applies to the next turn."
+	msg += ". Applies to the next turn."
+	if w := api.AliasWarning(m.sess.Provider, id); w != "" {
+		msg += "\nwarning: " + w + "."
+	}
+	return msg
+}
+
+// unlistedModelWarning checks a typed /model id against the list the provider
+// reported the last time /model fetched it, and returns a warning when the id
+// is not in it. It never fetches: a /model <id> that waited on the network
+// would be slower than finding out on the next turn, and when nothing has been
+// fetched yet there is nothing to say. It warns rather than refuses, because
+// an endpoint can serve ids it does not list (aliases, dated snapshots).
+func (m *Model) unlistedModelWarning(id string) string {
+	if len(m.knownModels) == 0 {
+		return ""
+	}
+	id = strings.TrimSpace(id)
+	resolved := string(api.ResolveModel(id))
+	for _, mi := range m.knownModels {
+		if mi.ID == id || mi.ID == resolved {
+			return ""
+		}
+	}
+	return "  " + id + " is not in the list this endpoint reported; if the next turn says the model was not found, run /model to pick one it lists."
 }

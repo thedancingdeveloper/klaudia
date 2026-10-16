@@ -26,6 +26,49 @@ type Type struct {
 	// system prompt. An instruction not to write is a request; this is the
 	// registry the sub-agent is handed.
 	ReadOnlyMCP bool
+	// Model, when set, is the model this sub-agent runs on (an alias or a
+	// full id); empty uses the parent's.
+	Model string
+	// MaxTurns bounds the child's own loop. 0 means the shared default.
+	MaxTurns int
+	// DisallowedTools are removed from Tools even when Tools says "*".
+	DisallowedTools []string
+	// Isolation says where a writer runs. "" and IsolationAuto isolate a writer
+	// and share the tree for a read-only type. IsolationWorktree always
+	// isolates; IsolationShared and the older "none" keep the shared tree.
+	Isolation string
+	// Verify is a shell command run in the child's directory after it finishes
+	// and before its changes are adopted. A non-zero exit keeps the checkout
+	// and appends the command's output to the report. "" means nothing is run.
+	// The frontmatter that sets it is loaded elsewhere; this is the field the
+	// spawner reads.
+	Verify string
+}
+
+// The isolation values a type and the Agent tool share. One set, so the tool
+// input and a type's frontmatter cannot drift apart. The loader stores a
+// frontmatter value as written (with "none" kept as its own alias) and the
+// spawner asks SharesTree rather than comparing strings.
+const (
+	// IsolationAuto isolates a type that can write and shares the tree otherwise.
+	IsolationAuto = "auto"
+	// IsolationWorktree always gives the child its own checkout.
+	IsolationWorktree = "worktree"
+	// IsolationShared keeps the child in the session's tree.
+	IsolationShared = "shared"
+	// IsolationNone is the older spelling of IsolationShared, still accepted
+	// from frontmatter written before the tool input existed.
+	IsolationNone = "none"
+)
+
+// SharesTree reports whether this isolation keeps the child in the session's
+// tree. Anything else isolates a writer (and a forced worktree).
+func SharesTree(isolation string) bool {
+	switch isolation {
+	case IsolationShared, IsolationNone:
+		return true
+	}
+	return false
 }
 
 // readOnlyTool is implemented by tools that can state they only read. MCP tools
@@ -73,14 +116,75 @@ func Builtin() []Type {
 	}
 }
 
-// Lookup returns the built-in type with the given name.
-func Lookup(name string) (Type, bool) {
-	for _, t := range Builtin() {
-		if t.Name == name {
-			return t, true
+// mutatingTools are the local tools that can change the working tree or the
+// host. A type that can call any of them is a "writer", which decides whether a
+// background instance of it needs an isolated git worktree (a read-only agent
+// can safely share the parent's tree). Bash counts because a command is free to
+// write; the read-only agents (Explore, Plan) hold none of these.
+var mutatingTools = map[string]bool{
+	"Write": true, "Edit": true, "MultiEdit": true, "NotebookEdit": true, "Bash": true,
+}
+
+// MayWrite reports whether this type can modify the working tree. A wildcard
+// toolset ("*") can, and so can any explicit set naming a mutating tool. A
+// wildcard whose mutating tools are all in DisallowedTools cannot. It is
+// derived from the granted toolset rather than the system prompt for the same
+// reason ReadOnlyMCP is: an instruction not to write is a request, but the tool
+// registry is what the sub-agent actually holds.
+func (t Type) MayWrite() bool {
+	banned := map[string]bool{}
+	for _, name := range t.DisallowedTools {
+		banned[name] = true
+	}
+	for _, name := range t.Tools {
+		if name == "*" {
+			for tool := range mutatingTools {
+				if !banned[tool] {
+					return true
+				}
+			}
+			continue
+		}
+		if mutatingTools[name] && !banned[name] {
+			return true
 		}
 	}
-	return Type{}, false
+	return false
+}
+
+// Lookup returns the built-in type with the given name, ignoring case and
+// separators.
+func Lookup(name string) (Type, bool) {
+	return Find(Builtin(), name)
+}
+
+// UnknownTools reports the tool names this type names that are not in base, so
+// a custom agent file that misspells a tool is reported at startup rather
+// than silently granting nothing. "*" is never unknown.
+func (t Type) UnknownTools(base *tools.Registry) []string {
+	known := map[string]bool{}
+	if base != nil {
+		for _, name := range base.Names() {
+			known[name] = true
+		}
+	}
+	return t.unknownNames(known)
+}
+
+// unknownNames is UnknownTools against a bare name set, which is all the
+// loader has at startup: the registry is not built yet, and an MCP tool that
+// connects later is simply not in it.
+func (t Type) unknownNames(known map[string]bool) []string {
+	var out []string
+	for _, name := range append(append([]string{}, t.Tools...), t.DisallowedTools...) {
+		if name == "*" {
+			continue
+		}
+		if _, ok := known[name]; !ok {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // Filter returns a new registry containing only the tools this type may use,
@@ -93,7 +197,7 @@ func (t Type) Filter(base *tools.Registry) *tools.Registry {
 				all = append(all, tool)
 			}
 		}
-		return tools.NewRegistry(all...)
+		return tools.NewRegistry(t.withoutDisallowed(all)...)
 	}
 	var allowed []tools.Tool
 	seen := make(map[string]bool, len(t.Tools))
@@ -132,5 +236,24 @@ func (t Type) Filter(base *tools.Registry) *tools.Registry {
 			}
 		}
 	}
-	return tools.NewRegistry(allowed...)
+	return tools.NewRegistry(t.withoutDisallowed(allowed)...)
+}
+
+// withoutDisallowed drops the tools this type's frontmatter forbids, so a
+// wildcard toolset can still say "everything except Bash".
+func (t Type) withoutDisallowed(in []tools.Tool) []tools.Tool {
+	if len(t.DisallowedTools) == 0 {
+		return in
+	}
+	ban := map[string]bool{}
+	for _, n := range t.DisallowedTools {
+		ban[n] = true
+	}
+	out := in[:0:0]
+	for _, tool := range in {
+		if !ban[tool.Name()] {
+			out = append(out, tool)
+		}
+	}
+	return out
 }

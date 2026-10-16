@@ -72,12 +72,12 @@ func (n *NotebookEdit) ValidateInput(raw json.RawMessage) error {
 func (n *NotebookEdit) PermissionRequest(raw json.RawMessage) permission.PermissionRequest {
 	var in NotebookEditInput
 	_ = json.Unmarshal(raw, &in)
-	return permission.PermissionRequest{Specifier: in.NotebookPath}
+	return pathRequest(in.NotebookPath)
 }
 
 // CheckPermissions: NotebookEdit mutates a file (edit-class).
-func (n *NotebookEdit) CheckPermissions(pctx permission.Context, _ permission.PermissionRequest) permission.Decision {
-	return editClassDecision(pctx)
+func (n *NotebookEdit) CheckPermissions(pctx permission.Context, req permission.PermissionRequest) permission.Decision {
+	return editPathDecision(pctx, req.Specifier)
 }
 
 func (in NotebookEditInput) editMode() string {
@@ -143,7 +143,7 @@ func (n *NotebookEdit) Execute(_ context.Context, tctx Context, raw json.RawMess
 	if err != nil {
 		return []Result{{Content: fmt.Sprintf("Error encoding notebook: %v", err), IsError: true}}, nil
 	}
-	if err := os.WriteFile(in.NotebookPath, append(out, '\n'), 0o644); err != nil {
+	if err := writeFileAtomic(in.NotebookPath, append(out, '\n'), 0o644); err != nil {
 		return []Result{{Content: fmt.Sprintf("Error writing notebook: %v", err), IsError: true}}, nil
 	}
 	return []Result{{Content: fmt.Sprintf("Notebook %s updated (%s)", in.NotebookPath, in.editMode())}}, nil

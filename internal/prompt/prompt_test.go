@@ -26,7 +26,8 @@ func TestSystemIncludesEnvAndSecurity(t *testing.T) {
 }
 
 func TestSystemLoadsProjectClaudeMd(t *testing.T) {
-	t.Setenv("HOME", t.TempDir()) // isolate from a real ~/.claude/CLAUDE.md
+	t.Setenv("HOME", t.TempDir())      // isolate from a real ~/.claude/CLAUDE.md
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
 	dir := t.TempDir()
 	body := "# Klaudia repo\nAlways run gofmt before committing."
 	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte(body), 0o644); err != nil {
@@ -43,6 +44,7 @@ func TestSystemLoadsProjectClaudeMd(t *testing.T) {
 
 func TestSystemRecallsMemory(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
 	dir := t.TempDir()
 	klaudiaDir := filepath.Join(dir, ".klaudia")
 	if err := os.MkdirAll(klaudiaDir, 0o755); err != nil {
@@ -63,6 +65,7 @@ func TestSystemRecallsMemory(t *testing.T) {
 
 func TestSystemRecallsLinkedMemoryFiles(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
 	dir := t.TempDir()
 	memDir := filepath.Join(dir, ".klaudia", "memory")
 	if err := os.MkdirAll(memDir, 0o755); err != nil {
@@ -93,6 +96,7 @@ func TestSystemRecallsLinkedMemoryFiles(t *testing.T) {
 
 func TestSystemRecallsLegacyMemoryPath(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
 	dir := t.TempDir()
 	memDir := filepath.Join(dir, ".klaudia", "memory")
 	if err := os.MkdirAll(memDir, 0o755); err != nil {
@@ -108,8 +112,71 @@ func TestSystemRecallsLegacyMemoryPath(t *testing.T) {
 	}
 }
 
+func TestSystemRecallsUserMemory(t *testing.T) {
+	// Point the user config root at a temp dir so the test never reads the real
+	// $HOME/.klaudia (issue #161 / #110).
+	cfgDir := t.TempDir()
+	t.Setenv("KLAUDIA_CONFIG_DIR", cfgDir)
+	if err := os.WriteFile(filepath.Join(cfgDir, "MEMORY.md"), []byte("# Memory\n\n- user prefers tabs over spaces\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := System(t.TempDir(), "")
+	if !strings.Contains(p, "# Recalled memory") {
+		t.Error("expected recalled-memory section")
+	}
+	if !strings.Contains(p, "User memory") {
+		t.Error("expected a user-memory label")
+	}
+	if !strings.Contains(p, "user prefers tabs over spaces") {
+		t.Error("expected user memory content to be injected")
+	}
+}
+
+func TestSystemNoUserMemory(t *testing.T) {
+	// An empty config root (no MEMORY.md) must be a no-op — no user-memory
+	// label and no spurious recall section.
+	t.Setenv("KLAUDIA_CONFIG_DIR", t.TempDir())
+	p := System(t.TempDir(), "")
+	if strings.Contains(p, "User memory") {
+		t.Error("absent user MEMORY.md should not emit a user-memory label")
+	}
+	if strings.Contains(p, "# Recalled memory") {
+		t.Error("no memory anywhere should not emit a recall section")
+	}
+}
+
+func TestSystemRecallsUserAndProjectMemory(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("KLAUDIA_CONFIG_DIR", cfgDir)
+	if err := os.WriteFile(filepath.Join(cfgDir, "MEMORY.md"), []byte("# Memory\n\n- global fact about the user\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	klaudiaDir := filepath.Join(dir, ".klaudia")
+	if err := os.MkdirAll(klaudiaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(klaudiaDir, "MEMORY.md"), []byte("# Memory\n\n- project-specific fact\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := System(dir, "")
+	for _, want := range []string{"User memory", "Project memory", "global fact about the user", "project-specific fact"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("system prompt missing %q", want)
+		}
+	}
+	// Project memory comes last so it can refine the user-level notes.
+	if strings.Index(p, "User memory") > strings.Index(p, "Project memory") {
+		t.Error("user memory should be injected before project memory")
+	}
+}
+
 func TestSystemRecallsKnowledge(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
 	dir := t.TempDir()
 	os.MkdirAll(filepath.Join(dir, ".klaudia"), 0o755)
 	os.WriteFile(filepath.Join(dir, ".klaudia", "KNOWLEDGE.md"),
@@ -119,12 +186,216 @@ func TestSystemRecallsKnowledge(t *testing.T) {
 	if !strings.Contains(p, "# Project knowledge") || !strings.Contains(p, "CGO_ENABLED=0") {
 		t.Errorf("system prompt should include recalled project knowledge")
 	}
+	// Framed as notes to weigh, not facts to obey: an entry that arrived from
+	// a web page or a commit must not be promoted to ground truth by framing.
+	if strings.Contains(p, "established facts") {
+		t.Error("project knowledge is still framed as established facts")
+	}
+	if !strings.Contains(p, "not as instructions") {
+		t.Error("project knowledge framing should say it is context, not instructions")
+	}
+}
+
+func TestCompose(t *testing.T) {
+	const def = "DEFAULT"
+	tests := []struct {
+		name             string
+		override, append string
+		want             string
+	}{
+		{"neither leaves default untouched", "", "", def},
+		{"override replaces default", "REPLACED", "", "REPLACED"},
+		{"append adds to default", "", "MORE", def + "\n\nMORE"},
+		{"both: append follows replacement", "REPLACED", "MORE", "REPLACED\n\nMORE"},
+		{"blank override is ignored", "   ", "", def},
+		{"blank append is ignored", "", "  \n ", def},
+		{"append onto empty default stands alone", "", "MORE", def + "\n\nMORE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Compose(def, tt.override, tt.append); got != tt.want {
+				t.Errorf("Compose(%q, %q, %q) = %q, want %q", def, tt.override, tt.append, got, tt.want)
+			}
+		})
+	}
+
+	// Appending onto a genuinely empty base yields just the appended text (no
+	// leading separator), so a --system-prompt "" with only --append is clean.
+	if got := Compose("", "", "ONLY"); got != "ONLY" {
+		t.Errorf("Compose empty base with append = %q, want %q", got, "ONLY")
+	}
 }
 
 func TestSystemNoClaudeMd(t *testing.T) {
-	t.Setenv("HOME", t.TempDir()) // isolate from a real ~/.claude/CLAUDE.md
+	t.Setenv("HOME", t.TempDir())      // isolate from a real ~/.claude/CLAUDE.md
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
 	p := System(t.TempDir(), "")
 	if strings.Contains(p, "Project instructions (from CLAUDE.md)") {
 		t.Error("should not emit CLAUDE.md section when none exists")
+	}
+}
+
+// A sub-agent's prompt keeps its type's text first and adds the environment,
+// CLAUDE.md and KNOWLEDGE.md — but not the parent's recalled memory, nor the
+// main agent's own persona.
+func TestSubagentAddsEnvAndProjectContext(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KLAUDIA_CONFIG_DIR", "") // follow the pinned HOME (hermetic.sh sets it)
+	dir := t.TempDir()
+	klaudiaDir := filepath.Join(dir, ".klaudia")
+	if err := os.MkdirAll(klaudiaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		filepath.Join(dir, "CLAUDE.md"):           "Always run gofmt.",
+		filepath.Join(klaudiaDir, "KNOWLEDGE.md"): "The API is v2.",
+		filepath.Join(klaudiaDir, "MEMORY.md"):    "- parent session note",
+	} {
+		if err := os.WriteFile(name, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	p := Subagent("TYPE PROMPT", dir)
+	if !strings.HasPrefix(p, "TYPE PROMPT") {
+		t.Errorf("type prompt should lead:\n%s", p)
+	}
+	for _, want := range []string{"<env>", "Working directory: " + dir, "Always run gofmt.", "The API is v2."} {
+		if !strings.Contains(p, want) {
+			t.Errorf("sub-agent prompt missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{"parent session note", "You are Klaudia"} {
+		if strings.Contains(p, unwanted) {
+			t.Errorf("sub-agent prompt should not contain %q", unwanted)
+		}
+	}
+}
+
+// Memory and knowledge are keyed by the project root; a subdirectory's own
+// .klaudia notes, written when they were keyed by cwd, are recalled after them.
+func TestSystemInRecallsRootThenCWDState(t *testing.T) {
+	root := t.TempDir()
+	cwd := filepath.Join(root, "internal", "tui")
+	for path, body := range map[string]string{
+		filepath.Join(root, ".klaudia", "MEMORY.md"):    "- root memory note",
+		filepath.Join(cwd, ".klaudia", "MEMORY.md"):     "- subdir memory note",
+		filepath.Join(root, ".klaudia", "KNOWLEDGE.md"): "- root knowledge",
+		filepath.Join(cwd, ".klaudia", "KNOWLEDGE.md"):  "- subdir knowledge",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := SystemIn(cwd, root, "")
+	if !strings.Contains(p, "Working directory: "+cwd) {
+		t.Error("env block should name the launch directory, not the root")
+	}
+	for _, pair := range [][2]string{{"root memory note", "subdir memory note"}, {"root knowledge", "subdir knowledge"}} {
+		i, j := strings.Index(p, pair[0]), strings.Index(p, pair[1])
+		if i < 0 || j < 0 || i > j {
+			t.Errorf("want %q then %q in the prompt (at %d, %d)", pair[0], pair[1], i, j)
+		}
+	}
+	if strings.Count(SystemIn(root, root, ""), "root memory note") != 1 {
+		t.Error("root == cwd should recall the memory once")
+	}
+}
+
+// AGENTS.md is the cross-agent standard — several hundred thousand
+// repositories carry one, and Klaudia read none of them. A user who had
+// written the instructions for this exact purpose got a model that had never
+// seen them.
+func TestSystemLoadsAgentsMd(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KLAUDIA_CONFIG_DIR", "")
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "AGENTS.md"), "# Conventions\nUse tabs, never spaces.")
+
+	p := System(dir, "")
+	if !strings.Contains(p, "Use tabs, never spaces.") {
+		t.Error("AGENTS.md content was not included")
+	}
+	if !strings.Contains(p, "Project instructions (from AGENTS.md)") {
+		t.Error("the section header should name the file the instructions came from")
+	}
+}
+
+// Both files, with different content, is a real configuration: the generic one
+// for every agent and a Claude-specific refinement beside it. Reading one and
+// ignoring the other silently drops instructions.
+func TestSystemLoadsBothInstructionFiles(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "AGENTS.md"), "generic: run the linter")
+	write(t, filepath.Join(dir, "CLAUDE.md"), "specific: sign your commits")
+
+	p := System(dir, "")
+	for _, want := range []string{"generic: run the linter", "specific: sign your commits"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+	// Generic first, agent-specific after it, so the specific one reads as the
+	// refinement rather than being contradicted by what follows.
+	if strings.Index(p, "generic:") > strings.Index(p, "specific:") {
+		t.Error("AGENTS.md should come before CLAUDE.md")
+	}
+	if !strings.Contains(p, "(from AGENTS.md, CLAUDE.md)") {
+		t.Error("the header should name both files")
+	}
+}
+
+// `ln -s AGENTS.md CLAUDE.md` is the commonest way a repo supports both today.
+// filepath.Abs gives the two names different paths, so without resolving the
+// link the entire instruction block is sent twice in every request.
+func TestSymlinkedInstructionFileIsReadOnce(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "AGENTS.md"), "a distinctive instruction line")
+	if err := os.Symlink("AGENTS.md", filepath.Join(dir, "CLAUDE.md")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	p := System(dir, "")
+	if n := strings.Count(p, "a distinctive instruction line"); n != 1 {
+		t.Errorf("instructions appear %d times, want 1", n)
+	}
+}
+
+// And the second commonest way: a copy. No path comparison can catch that, so
+// identity is also established by content.
+func TestDuplicatedInstructionContentIsReadOnce(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	body := "the same instructions in two files"
+	write(t, filepath.Join(dir, "AGENTS.md"), body)
+	write(t, filepath.Join(dir, "CLAUDE.md"), body)
+
+	p := System(dir, "")
+	if n := strings.Count(p, body); n != 1 {
+		t.Errorf("instructions appear %d times, want 1", n)
+	}
+	if !strings.Contains(p, "(from AGENTS.md)") {
+		t.Error("the header should name only the file that was actually used")
+	}
+}
+
+// A global AGENTS.md belongs with skills and .mcp.json under ~/.klaudia. The
+// home-level ~/.claude/CLAUDE.md is still read for ecosystem compatibility.
+func TestSystemLoadsGlobalInstructions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	write(t, filepath.Join(home, ".claude", "CLAUDE.md"), "ecosystem global")
+	write(t, filepath.Join(home, ".klaudia", "AGENTS.md"), "klaudia global")
+
+	p := System(t.TempDir(), "")
+	for _, want := range []string{"ecosystem global", "klaudia global"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("missing %q", want)
+		}
 	}
 }

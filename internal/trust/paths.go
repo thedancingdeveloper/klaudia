@@ -186,6 +186,74 @@ var credentialPaths = []string{
 	"/Library/Keychains", "/etc/ssh",
 }
 
+// CredentialPaths returns the credential locations under home as absolute
+// paths, for a sandbox to hide, and the exceptions inside them to leave
+// visible (known_hosts and ssh config hold no secret, and ssh needs them).
+// /etc/ssh is left out: the ssh client reads its config there, and the host
+// keys in it are readable only by root anyway.
+func CredentialPaths(home string) (hide, keep []string) {
+	for _, p := range credentialPaths {
+		if p == "/etc/ssh" {
+			continue
+		}
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(home, p)
+		}
+		hide = append(hide, p)
+	}
+	for _, p := range credentialExceptions {
+		keep = append(keep, filepath.Join(home, p))
+	}
+	return hide, keep
+}
+
+// CredentialGuard returns a predicate for a directory walk rooted at root (an
+// absolute path): true for a credential location the walk must not enter.
+//
+// A search tool's permission check looks only at its root, so a search rooted
+// at $HOME with hidden entries included would read ~/.aws/credentials without
+// a prompt. The walk therefore never enters a credential location — unless
+// the root is already inside one, which is a search aimed there on purpose,
+// and the root check (ClassifyToolCall) is what asks about that. Nil when no
+// location applies.
+func CredentialGuard(home, root string) func(abs string) bool {
+	rootReal := canonicalPolicy(root)
+	var locs []string
+	for _, c := range credentialPaths {
+		full := c
+		if !filepath.IsAbs(c) {
+			if home == "" {
+				continue
+			}
+			full = filepath.Join(home, c)
+		}
+		forms := []string{filepath.Clean(full)}
+		if real := canonicalPolicy(full); real != forms[0] {
+			forms = append(forms, real)
+		}
+		inside := false
+		for _, f := range forms {
+			if under(root, f) || under(rootReal, f) {
+				inside = true
+			}
+		}
+		if !inside {
+			locs = append(locs, forms...)
+		}
+	}
+	if len(locs) == 0 {
+		return nil
+	}
+	return func(abs string) bool {
+		for _, l := range locs {
+			if under(abs, l) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
 // credentialExceptions are inside a credential directory but hold no secret.
 // known_hosts in particular is touched constantly by ordinary ssh use.
 var credentialExceptions = []string{
@@ -213,6 +281,19 @@ func init() {
 func isSystemPrefix(p string) bool {
 	for _, h := range hostPrefixes {
 		if p == h {
+			return true
+		}
+	}
+	return false
+}
+
+// InProject reports whether an already-canonical path is one of the project
+// roots or inside one. Unlike ClassifyPath, it does not count anything else as
+// project work: the rest of $HOME, the temp dir and tool caches are all
+// outside.
+func (r Roots) InProject(path string) bool {
+	for _, root := range r.Project {
+		if under(path, root) {
 			return true
 		}
 	}
